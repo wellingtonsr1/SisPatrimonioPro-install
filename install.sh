@@ -30,7 +30,7 @@ IFS=$'\n\t'
 # ----------------------------------------------------------------------------
 # Constantes e defaults (data-model §1.1)
 # ----------------------------------------------------------------------------
-readonly DEFAULT_REPO_URL="https://github.com/wellingtonsr1/sistema_patrimonio_mysql.git"
+readonly DEFAULT_REPO_URL="https://github.com/wellingtonsr1/SisPatrimonioPro.git"
 readonly DEFAULT_BRANCH="main"
 readonly DEFAULT_INSTALL_DIR="/opt/SisPatrimonioPro"
 readonly DEFAULT_DB_NAME="sispatrimoniopro"
@@ -287,6 +287,13 @@ validate_inputs() {  # validação TOTAL antes da primeira mutação (FR-015/R12
     if [ -n "$DB_PASSWORD" ] && [ "${#DB_PASSWORD}" -lt 12 ]; then
         die "Senha manual do banco deve ter no mínimo 12 caracteres (gerada atende automaticamente)."
     fi
+
+    # Backslash na senha: o MySQL interpreta \n/\t etc. dentro de string literal
+    # (sem NO_BACKSLASH_ESCAPES) — dobrar aspas não protege. Rejeita ANTES de
+    # qualquer mutação (FR-015); a senha gerada (token_urlsafe) nunca contém \.
+    case "$DB_PASSWORD" in
+        *\\*) die "Senha manual do banco não pode conter backslash (\) — escolha outra senha ou use --generate-db-password." ;;
+    esac
 }
 
 collect_secrets() {  # modo interativo: coleta senha (sem eco) ou marca para gerar
@@ -308,6 +315,8 @@ collect_secrets() {  # modo interativo: coleta senha (sem eco) ou marca para ger
             ok "Senha do banco gerada automaticamente (gravada apenas no .env)."
         elif [ "${#DB_PASSWORD}" -lt 12 ]; then
             die "Senha manual do banco deve ter no mínimo 12 caracteres (ou deixe vazia para gerar)."
+        elif [[ "$DB_PASSWORD" == *\\* ]]; then
+            die "Senha do banco não pode conter backslash (\) — escolha outra senha ou deixe vazia para gerar automaticamente."
         fi
     fi
 }
@@ -645,9 +654,11 @@ confirm_recreate_db() {  # R13/D2: aviso + dupla confirmação digitando o nome 
 }
 
 sql_escape() {  # escape SQL para literais entre aspas simples (padrão SQL: ' -> '')
-    # valida contra backslash no fim (MySQL interpreta \' como escape dentro de string)
+    # REJEITA qualquer backslash (não só no fim): o MySQL interpreta sequências
+    # como \n/\t dentro de string (sem NO_BACKSLASH_ESCAPES) — dobrar aspas não
+    # protege contra backslash e a senha ficaria corrompida no CREATE/ALTER USER.
     case "$1" in
-        *\\) die "Senha contém backslash final — não suportado pelo escape SQL do instalador (escolha outra senha)." ;;
+        *\\*) die "Senha contém backslash (\) — não suportado pelo escape SQL do instalador (escolha outra senha)." ;;
     esac
     printf '%s' "$1" | sed "s/'/''/g"
 }
@@ -807,11 +818,14 @@ ENVEOF
 }
 
 build_database_url() {  # percent-encoding programático (nunca montagem manual — R5/R6)
+    # quote(safe='') e NÃO quote_plus: espaço vira %20 (quote_plus usaria '+' —
+    # que o parse de URL do SQLAlchemy NÃO decodifica como espaço, corrompendo
+    # a senha e causando Access denied); '@' → %40, '#' → %23 etc. ficam ok.
     DATABASE_URL_BUILT="$("$INSTALL_DIR/.venv/bin/python" - "$DB_USER" "$DB_PASSWORD" "$DB_HOST" "$DB_PORT" "$DB_NAME" <<'PYEOF'
 import sys
-from urllib.parse import quote_plus
+from urllib.parse import quote
 user, pwd, host, port, db = sys.argv[1:6]
-print(f"mariadb+pymysql://{quote_plus(user)}:{quote_plus(pwd)}@{host}:{port}/{db}")
+print(f"mariadb+pymysql://{quote(user, safe='')}:{quote(pwd, safe='')}@{host}:{port}/{db}")
 PYEOF
 )"
 }
