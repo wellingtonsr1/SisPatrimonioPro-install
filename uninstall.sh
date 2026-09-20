@@ -27,6 +27,7 @@
 # ============================================================================
 set -Eeuo pipefail
 IFS=$'\n\t'
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 
 VERSION="1.0.0"
 SERVICE_NAME="sispatrimoniopro"
@@ -188,7 +189,9 @@ remove_service_user() {
     else
         ok "Usuário $SERVICE_USER não existe — nada a fazer."
     fi
-    getent group "$SERVICE_GROUP" >/dev/null 2>&1 && groupdel "$SERVICE_GROUP" 2>/dev/null || true
+    if getent group "$SERVICE_GROUP" >/dev/null 2>&1; then
+        groupdel "$SERVICE_GROUP" 2>/dev/null || true
+    fi
 }
 
 remove_database() {

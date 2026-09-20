@@ -26,6 +26,7 @@
 # ============================================================================
 set -Eeuo pipefail
 IFS=$'\n\t'
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-}"
 
 # ----------------------------------------------------------------------------
 # Constantes e defaults (data-model §1.1)
@@ -415,7 +416,12 @@ detect_host() {
         warn "Python 3 não encontrado."
     fi
     HAS_GIT="false"
-    command -v git >/dev/null 2>&1 && { HAS_GIT="true"; ok "Git detectado."; } || warn "Git não encontrado."
+    if command -v git >/dev/null 2>&1; then
+        HAS_GIT="true"
+        ok "Git detectado."
+    else
+        warn "Git não encontrado."
+    fi
 
     # D3/R4: detecta MariaDB OU MySQL por serviço e utilitários reais
     BANCO_SERVICE_DETECTED=""
@@ -649,7 +655,9 @@ confirm_recreate_db() {  # R13/D2: aviso + dupla confirmação digitando o nome 
     read -r c1
     prompt_printf 'Digite novamente (2/2): '
     read -r c2
-    [ "$c1" = "$DB_NAME" ] && [ "$c2" = "$DB_NAME" ] || die "Confirmação divergente. Operação abortada — nada foi alterado."
+    if [ "$c1" != "$DB_NAME" ] || [ "$c2" != "$DB_NAME" ]; then
+        die "Confirmação divergente. Operação abortada — nada foi alterado."
+    fi
     ok "Dupla confirmação recebida."
 }
 
@@ -809,9 +817,11 @@ APP_PORT=$APP_PORT
 ENVEOF
 
     if ! command -v mysqldump >/dev/null 2>&1; then
-        echo "" >> "$env_file"
-        echo "# Caminho do mysqldump (não está no PATH do processo do serviço)" >> "$env_file"
-        echo "MYSQLDUMP_PATH=$(command -v mysqldump || echo /usr/bin/mysqldump)" >> "$env_file"
+        {
+            echo ""
+            echo "# Caminho do mysqldump (não está no PATH do processo do serviço)"
+            echo "MYSQLDUMP_PATH=$(command -v mysqldump || echo /usr/bin/mysqldump)"
+        } >> "$env_file"
     fi
     chmod 600 "$env_file"
     ok ".env gerado com permissões 0600 (senha percent-encoded — SR-002)."
@@ -992,27 +1002,76 @@ post_install_checks() {
     STEP="Bateria de verificação pós-instalação"
     local failures=0
 
-    python_at_least "$MIN_PYTHON_MAJOR" "$MIN_PYTHON_MINOR" && ok "Python >= ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR}: OK" || { err "Python: FALHOU"; failures=$((failures+1)); }
-    venv_ok && ok "venv + dependências: OK" || { err "venv/dependências: FALHOU"; failures=$((failures+1)); }
-    systemctl is-active --quiet "$BANCO_SERVICE_DETECTED" && ok "Banco ativo ($BANCO_SERVICE_DETECTED): OK" || { err "Banco ativo: FALHOU"; failures=$((failures+1)); }
+    if python_at_least "$MIN_PYTHON_MAJOR" "$MIN_PYTHON_MINOR"; then
+        ok "Python >= ${MIN_PYTHON_MAJOR}.${MIN_PYTHON_MINOR}: OK"
+    else
+        err "Python: FALHOU"
+        failures=$((failures + 1))
+    fi
+
+    if venv_ok; then
+        ok "venv + dependências: OK"
+    else
+        err "venv/dependências: FALHOU"
+        failures=$((failures + 1))
+    fi
+
+    if systemctl is-active --quiet "$BANCO_SERVICE_DETECTED"; then
+        ok "Banco ativo ($BANCO_SERVICE_DETECTED): OK"
+    else
+        err "Banco ativo: FALHOU"
+        failures=$((failures + 1))
+    fi
+
     # Mesmo contrato da unit (WorkingDirectory): imports de app.* exigem CWD = projeto
-    ( cd "$INSTALL_DIR" && "$INSTALL_DIR/.venv/bin/python" - <<PYEOF >/dev/null 2>&1) && ok "Conexão com o banco: OK" || { err "Conexão com o banco: FALHOU"; failures=$((failures+1)); }
+    if ( cd "$INSTALL_DIR" && "$INSTALL_DIR/.venv/bin/python" - <<PYEOF >/dev/null 2>&1
 from app.database import SessionLocal
 from sqlalchemy import text
 db = SessionLocal()
 db.execute(text("SELECT 1"))
 db.close()
 PYEOF
-    ( cd "$INSTALL_DIR" && "$INSTALL_DIR/.venv/bin/python" - <<PYEOF >/dev/null 2>&1) && ok "Tabela base (users) existente: OK" || { err "Tabela base: FALHOU"; failures=$((failures+1)); }
+    ); then
+        ok "Conexão com o banco: OK"
+    else
+        err "Conexão com o banco: FALHOU"
+        failures=$((failures + 1))
+    fi
+
+    if ( cd "$INSTALL_DIR" && "$INSTALL_DIR/.venv/bin/python" - <<PYEOF >/dev/null 2>&1
 from app.database import SessionLocal
 from sqlalchemy import text
 db = SessionLocal()
 db.execute(text("SELECT 1 FROM users LIMIT 1"))
 db.close()
 PYEOF
-    systemctl is-active --quiet "$SERVICE_NAME" && ok "Serviço $SERVICE_NAME ativo: OK" || { err "Serviço ativo: FALHOU"; failures=$((failures+1)); }
-    systemctl is-enabled --quiet "$SERVICE_NAME" && ok "Serviço habilitado no boot: OK" || { err "Serviço habilitado: FALHOU"; failures=$((failures+1)); }
-    curl -fsS "http://127.0.0.1:$APP_PORT/health" >/dev/null 2>&1 && ok "HTTP /health: OK" || { err "HTTP /health: FALHOU"; failures=$((failures+1)); }
+    ); then
+        ok "Tabela base (users) existente: OK"
+    else
+        err "Tabela base: FALHOU"
+        failures=$((failures + 1))
+    fi
+
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        ok "Serviço $SERVICE_NAME ativo: OK"
+    else
+        err "Serviço ativo: FALHOU"
+        failures=$((failures + 1))
+    fi
+
+    if systemctl is-enabled --quiet "$SERVICE_NAME"; then
+        ok "Serviço habilitado no boot: OK"
+    else
+        err "Serviço habilitado: FALHOU"
+        failures=$((failures + 1))
+    fi
+
+    if curl -fsS "http://127.0.0.1:$APP_PORT/health" >/dev/null 2>&1; then
+        ok "HTTP /health: OK"
+    else
+        err "HTTP /health: FALHOU"
+        failures=$((failures + 1))
+    fi
 
     if [ "$failures" -gt 0 ]; then
         die "$failures verificação(ões) pós-instalação falharam — veja mensagens acima e o log."
@@ -1073,10 +1132,15 @@ security_self_check() {
     fi
     local perms
     perms="$(stat -c '%a' "$INSTALL_DIR/.env" 2>/dev/null || echo '?')"
-    [ "$perms" = "600" ] && ok ".env com permissão 600 (SR-002)." || warn ".env com permissão $perms (esperado 600)."
-    # Grants sem privilégios globais (SR-003): nenhuma linha com ON `*`.*
+    if [ "$perms" = "600" ]; then
+        ok ".env com permissão 600 (SR-002)."
+    else
+        warn ".env com permissão $perms (esperado 600)."
+    fi
+    # Grants sem privilégios globais (SR-003): nenhuma linha com ON `*`.* ou ON *.*
     local grants
-    grants="$("$BANCO_CLIENT_CMD" -N -B -e "SHOW GRANTS FOR '$DB_USER'@'localhost';" 2>/dev/null | grep -c 'ON \`\*\`\.\*\`' || true)"
+    # shellcheck disable=SC2016
+    grants="$("$BANCO_CLIENT_CMD" -N -B -e "SHOW GRANTS FOR '$DB_USER'@'localhost';" 2>/dev/null | grep -cE 'ON (`\*`|\*)\.(`\*`|\*)' || true)"
     if [ "${grants:-0}" = "0" ]; then
         ok "Usuário do banco sem privilégios globais (SR-003)."
     else
