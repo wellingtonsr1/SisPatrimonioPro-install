@@ -1,6 +1,8 @@
 # SisPatrimonioPro-install
 
-Documentação e análise aprofundada dos instaladores de produção do SisPatrimônio Pro (Feature 027): a instalação **nativa** (`install.sh` — systemd + MariaDB do host) e a variante **Docker** (`install-docker.sh` — Docker Compose com os arquivos versionados no repositório).                                                                            
+Documentação e análise aprofundada dos instaladores de produção do SisPatrimônio Pro (Feature 027): a instalação **nativa** (`install.sh` — systemd + MariaDB do host) e a variante **Docker** (`install-docker.sh` — Docker Compose com os arquivos versionados no repositório).
+
+  Há também **versões Windows (PowerShell)** de todos os instaladores/desinstaladores em `install no windows/` — mesmo contrato de segurança e idempotência, com as adaptações necessárias da plataforma. Veja a seção **🪟 Instalação no Windows**.                                                                            
   ──────                                                                                                                                                                                   
   ### Visão Geral e Propósito                                                                                                                                                              
                                                                                                                                                                                            
@@ -119,6 +121,109 @@ Documentação e análise aprofundada dos instaladores de produção do SisPatri
   6. **Log do instalador** (`/var/log/sispatrimonio-install-docker.log`)
 
   > O Docker Engine (daemon) **nunca** é removido — é infraestrutura de uso geral do servidor. O banco/volume são detectados do compose + `.env` instalados (não hardcoded); se o compose/.env não existirem, o volume é inferido do diretório e o nome do banco é perguntado.
+
+  ──────
+  ## 🪟 Instalação no Windows (PowerShell — nativa e Docker)
+
+  Versões Windows dos instaladores, em PowerShell, mantendo **o mesmo contrato** dos scripts Linux: idempotência total, sigilo de credenciais (nunca em argv/log), `.env` nunca sobrescrito (backup + mescla só de chaves ausentes), dupla confirmação para ações destrutivas e bateria pós-instalação.
+
+  | Linux (original) | Windows (equivalente) | O que faz |
+  |---|---|---|
+  | `install no linux/nativa/install.sh` | `install no windows/nativa/install.ps1` | Instalação nativa (Python + Git + MariaDB no host) |
+  | `install no linux/nativa/uninstall.sh` | `install no windows/nativa/uninstall.ps1` | Desinstalação nativa |
+  | `install no linux/docker/install-docker.sh` | `install no windows/docker/install-docker.ps1` | Instalação via Docker Compose (compose do repo) |
+  | `install no linux/docker/uninstall-docker.sh` | `install no windows/docker/uninstall-docker.ps1` | Desinstalação via Docker |
+
+  #### Requisitos
+
+  - Windows 10/11 ou Windows Server 2019+ · PowerShell 5.1 (ou 7) **executando como Administrador**
+  - Variante nativa: conexão à internet (winget instala Python 3.12, Git e MariaDB 11.4 se ausentes)
+  - Variante Docker: Docker Desktop em execução (ou Docker Engine + Compose v2); Git no host
+
+  #### Uso — instalação nativa
+
+  ```powershell
+  # Interativo (senha do banco sem eco; vazio nas duas entradas = gerar)
+  powershell -ExecutionPolicy Bypass -File install.ps1
+
+  # Não interativo (senha gerada automaticamente, vai direto ao .env)
+  powershell -ExecutionPolicy Bypass -File install.ps1 -NonInteractive -GenerateDbPassword
+
+  # Porta e diretório customizados
+  powershell -ExecutionPolicy Bypass -File install.ps1 -AppPort 8080 -InstallDir D:\SisPatrimonioPro
+  ```
+
+  O que o instalador faz (15 etapas, espelhando o `install.sh`): valida entradas e privilégios de administrador, detecta Python/Git/MariaDB (instala via winget o que faltar, inclusive o serviço do banco), clona o repositório, cria o venv e instala o `requirements.txt` (validação por imports), monta a `DATABASE_URL` com percent-encoding via Python (senha nunca em argv/log), cria/reutiliza banco + usuário (privilégios só no banco da aplicação — SR-003), gera o `.env` com ACL restrita, testa a conexão via engine do projeto, registra a **Tarefa Agendada** (dispara no boot, reinicia até 3x em falha, roda como SYSTEM), para a tarefa de rodada anterior (evita corrida com o `init_db`), executa o `init_db()`, faz start + polling de `/health` (até 120s), roda a bateria pós-instalação, a auditoria de segurança e cria a regra de firewall de entrada.
+
+  #### Uso — variante Docker
+
+  ```powershell
+  # Interativo (pede a senha do banco sem eco; vazio nas duas entradas = gerar)
+  powershell -ExecutionPolicy Bypass -File install-docker.ps1
+
+  # Não interativo (senha gerada automaticamente, vai direto ao .env)
+  powershell -ExecutionPolicy Bypass -File install-docker.ps1 -NonInteractive -GenerateDbPassword
+
+  # Porta do host customizada
+  powershell -ExecutionPolicy Bypass -File install-docker.ps1 -AppPort 8080
+  ```
+
+  Mesma arquitetura da variante Docker Linux: usa o `docker-compose.yml` + `Dockerfile` **versionados no repositório** (fonte da verdade — nunca alterados), analisa o compose (`docker compose config --format json` + `ConvertFrom-Json` — sem dependência de Python/jq no host), gera o `.env` com `DB_PASSWORD`, `DB_ROOT_PASSWORD` (sempre gerado — o default `changeme-root` **nunca** entra em produção), `SECRET_KEY`, `APP_PORT` e `TZ`, valida a credencial do usuário contra o banco (realinha via `ALTER USER` com `DB_ROOT_PASSWORD` em caso de divergência), executa `init_db()` em container efêmero e valida `/health` (até 180s).
+
+  #### Opções da CLI (equivalência Linux → Windows)
+
+  | Linux | Windows | Nota |
+  |---|---|---|
+  | `--non-interactive` | `-NonInteractive` | exige `-DbPassword` ou `-GenerateDbPassword` |
+  | `--install-dir <caminho>` | `-InstallDir <caminho>` | default: `C:\SisPatrimonioPro` (Linux: `/opt/SisPatrimonioPro`) |
+  | `--repo <url>` / `--branch <nome>` | `-Repo <url>` / `-Branch <nome>` | defaults: repo oficial / `main` |
+  | `--db-name` / `--db-user` | `-DbName` / `-DbUser` | na variante Docker: **somente conferência** contra o compose (divergir aborta) |
+  | `--db-password <senha>` / `--generate-db-password` | `-DbPassword <senha>` / `-GenerateDbPassword` | mesma política de caracteres na variante Docker |
+  | `--db-host` / `--db-port` | `-DbHost` / `-DbPort` | default Windows: `127.0.0.1:3306` (TCP; o Linux usa socket) |
+  | `--app-host` / `--app-port` | `-AppHost` / `-AppPort` | default: `0.0.0.0` / `8000` |
+  | `--service-name` / `--service-user` | `-ServiceName` / `-ServiceUser` | tarefa agendada; default: `sispatrimoniopro` / `SYSTEM` |
+  | `--recreate-db` | `-RecreateDb` | APAGA o banco (dupla confirmação; proibido com `-NonInteractive`) |
+  | `--reset-db` (Docker) | `-ResetDb` | APAGA o **volume** do banco (dupla confirmação; `app-data` preservado) |
+  | `--update` | `-Update` | reservado — ainda não implementado (NFR-005) |
+
+  #### Equivalências e divergências técnicas (necessárias no Windows)
+
+  | Linux | Windows | Observação |
+  |---|---|---|
+  | systemd (unit `sispatrimoniopro.service`) | **Tarefa Agendada** (boot + restart em falha, como `SYSTEM`) | substitui o serviço; `Restart=on-failure` → `RestartCount 3` |
+  | `.env` 0600 (`umask 077`) | **ACL restrita** via `icacls /inheritance:r` (apenas SYSTEM, Administradores e usuário atual) | mesmo isolamento, mecanismo nativo |
+  | `apt install` (Python/Git/MariaDB) | **winget** (`Python.Python.3.12`, `Git.Git`, `MariaDB.MariaDB.11.4`) | idempotente — só instala o que falta |
+  | admin do banco via socket unix_auth | senha de **root via TCP**: variável de ambiente `SISPAT_DB_ADMIN_PASSWORD` (não interativo) ou coletada sem eco | divergência documentada no cabeçalho do script |
+  | — | **Regra de firewall** de entrada criada para a porta da app | o Windows bloqueia portas por padrão (o Linux não) |
+  | usuário do banco `'usuario'@'localhost'` | usuários para `localhost` **e** `127.0.0.1` | conexão TCP no Windows |
+  | usuário de sistema Linux dedicado (`nologin`) | tarefa roda como `SYSTEM` + `.env` protegido por ACL | criação de conta sem login via script é frágil no Windows |
+
+  #### Desinstalação (Windows)
+
+  ```powershell
+  # Nativa
+  powershell -ExecutionPolicy Bypass -File uninstall.ps1               # interativo (pergunta tudo)
+  powershell -ExecutionPolicy Bypass -File uninstall.ps1 -Yes          # app+tarefa+firewall; banco AINDA exige digitar o nome
+  powershell -ExecutionPolicy Bypass -File uninstall.ps1 -KeepDb       # preserva banco e usuário do banco
+  powershell -ExecutionPolicy Bypass -File uninstall.ps1 -PurgeMariaDb # remove o MariaDB inteiro (dupla confirmação)
+
+  # Docker
+  powershell -ExecutionPolicy Bypass -File uninstall-docker.ps1              # interativo
+  powershell -ExecutionPolicy Bypass -File uninstall-docker.ps1 -Yes         # containers+diretório+imagens órfãs; volume exige o nome
+  powershell -ExecutionPolicy Bypass -File uninstall-docker.ps1 -KeepDb      # preserva o volume do banco (dados)
+  powershell -ExecutionPolicy Bypass -File uninstall-docker.ps1 -PurgeDocker # também remove imagens (dupla confirmação)
+  ```
+
+  Ordem da remoção e confirmações idênticas ao Linux: remover o banco/volume exige **digitar o nome do banco** (mesmo com `-Yes`); `-PurgeMariaDb`/`-PurgeDocker` exigem digitar `PURGAR-MARIADB`/`PURGAR-IMAGENS` + confirmação dupla; o volume `app-data` (backups/logs) tem confirmação própria e separada. O Docker Desktop/Engine **nunca** é removido. Banco/volume são detectados do compose + `.env` instalados (não hardcoded).
+
+  > 🛠️ **Problemas na instalação Windows?** Consulte o [guia rápido de troubleshooting](install%20no%20windows/TROUBLESHOOTING.md) — sintomas → diagnóstico → solução para as 17 falhas mais comuns (scripts bloqueados, winget, serviço do MariaDB, credencial de root, porta em uso, timeout no `/health`, Docker daemon, volume em uso, tarefa no boot, proxy etc.), incluindo um comando que coleta um pacote de diagnóstico **sem credenciais** para anexar ao chamado.
+
+  #### Notas de implementação (Windows)
+
+  - Scripts **100% ASCII** de propósito: o Windows PowerShell 5.1 lê `.ps1` sem BOM como ANSI, o que corromperia acentuação nas mensagens.
+  - Credenciais: coleta sem eco (`Read-Host -AsSecureString`), geração via RNG criptográfico (base64url — sem backslash, seguro para o percent-encoding da `DATABASE_URL` e para o interpolation do compose); `MYSQL_PWD` vai por ambiente (`exec -e` no Docker), nunca em argv/log; auditoria final varre o log por vazamento (mesmo SR-001).
+  - Erros de comandos nativos (git/pip/mysql/docker) são tratados por `$LASTEXITCODE` + `die` com diagnóstico — deliberadamente **não** por `ErrorActionPreference=Stop` global (no PS 5.1, redirecionar stderr de processo nativo com EAP=Stop promove linhas comuns a erros fatais espúrios).
+  - Exit codes idênticos ao Linux: `0` sucesso · `2` uso inválido · `1` falha de execução. Log do instalador em `%ProgramData%\sispatrimonio-install.log` (e `...-docker.log`).
 
   ──────
   ## 🖥️ Instalação Nativa (install.sh) — Análise Aprofundada
@@ -256,5 +361,5 @@ Documentação e análise aprofundada dos instaladores de produção do SisPatri
   O script demonstra maturidade de engenharia de software e práticas de SRE/DevOps muito acima da média. Ele evita os erros mais comuns de scripts bash (como comandos em argv vazando     
   senhas, assincronia de buffers, poluição de logs e falta de idempotência).  As correções pontuais sugeridas acima elevam ainda mais sua resiliência e portabilidade entre diferentes versões do MariaDB/MySQL.
 
-  > **Nota:** a variante Docker (`install-docker.sh`) herda deliberadamente estes mesmos princípios — idempotência, sigilo de credenciais em argv/log, `.env` 0600, confirmação dupla para ações destrutivas e bateria pós-instalação — trocando systemd/venv/MariaDB nativo pelos containers definidos no `docker-compose.yml` do repositório. Veja a seção **Instalação via Docker** no início deste documento.
+  > **Nota:** a variante Docker (`install-docker.sh`) herda deliberadamente estes mesmos princípios — idempotência, sigilo de credenciais em argv/log, `.env` 0600, confirmação dupla para ações destrutivas e bateria pós-instalação — trocando systemd/venv/MariaDB nativo pelos containers definidos no `docker-compose.yml` do repositório. Veja a seção **Instalação via Docker** no início deste documento. O mesmo vale para as versões Windows (PowerShell) em `install no windows/` — herdam exatamente os mesmos princípios, confirmações e baterias de verificação, com as adaptações de plataforma documentadas na seção **Instalação no Windows**.
 
