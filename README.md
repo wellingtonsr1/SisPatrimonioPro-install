@@ -11,7 +11,8 @@ Documentação e análise aprofundada dos instaladores de produção do SisPatri
                                                                                                                                                                                            
   1. Idempotência total: Pode ser reexecutado múltiplas vezes sem corromper dados, quebrar o estado anterior ou duplicar recursos.                                                         
   2. Defensividade e Robustez: Uso estrito de flags do bash (set -Eeuo pipefail), validação prévia de todas as entradas antes de qualquer mutação, traps de erro detalhados e canal único  
-  de I/O sem buffering.  3. Segurança por Padrão: Credenciais não vazam em logs, ps aux ou /proc/<pid>/cmdline; privilégios mínimos no banco de dados e no sistema operacional.
+  de I/O sem buffering.
+  3. Segurança por Padrão: Credenciais não vazam em logs, ps aux ou /proc/<pid>/cmdline; privilégios mínimos no banco de dados e no sistema operacional.
   ──────
   ## 🐳 Instalação via Docker (install-docker.sh)
 
