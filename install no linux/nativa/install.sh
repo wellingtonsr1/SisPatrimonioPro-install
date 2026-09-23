@@ -50,7 +50,7 @@ readonly BACKUP_DIR="data/backups"
 readonly MIN_PYTHON_MAJOR=3
 readonly MIN_PYTHON_MINOR=10
 
-APP_VERSION_INSTALLER="1.0.0"
+APP_VERSION_INSTALLER="1.1.0"
 NON_INTERACTIVE="false"
 RECREATE_DB="false"
 INSTALL_DIR=""
@@ -68,6 +68,7 @@ SERVICE_USER="$DEFAULT_SERVICE_USER"
 SERVICE_GROUP="$DEFAULT_SERVICE_GROUP"
 GENERATE_DB_PASSWORD="false"
 DB_PASSWORD_CHANGED="false"   # true quando o usuário do banco foi criado/recriado nesta execução
+WHEEL_DIR=""                  # ponto 4 (README): wheels locais para instalação offline/air-gapped
 
 STEP=""
 STEP_NO=0
@@ -203,6 +204,9 @@ Uso: sudo bash install.sh [opções]
   --install-dir <caminho>     Diretório de instalação (default: ${DEFAULT_INSTALL_DIR})
   --repo <url>                Repositório Git (default: repo oficial)
   --branch <nome>             Branch (default: ${DEFAULT_BRANCH})
+  --wheel-dir <caminho>       Diretório local de wheels (.whl) para instalação
+                              OFFLINE/air-gapped (pip --no-index --find-links;
+                              use junto de --repo /caminho/local como fonte)
   --db-name <nome>            Nome do banco (default: ${DEFAULT_DB_NAME})
   --db-user <usuário>         Usuário do banco (default: ${DEFAULT_DB_USER})
   --db-password <senha>       Senha do banco (não interativo; NÃO use em produção compartilhada)
@@ -229,6 +233,7 @@ parse_args() {
             --install-dir)     INSTALL_DIR="${2:-}"; shift ;;
             --repo)            REPO_URL="${2:-}"; shift ;;
             --branch)          BRANCH="${2:-}"; shift ;;
+            --wheel-dir)       WHEEL_DIR="${2:-}"; shift ;;
             --db-name)         DB_NAME="${2:-}"; shift ;;
             --db-user)         DB_USER="${2:-}"; shift ;;
             --db-password)     DB_PASSWORD="${2:-}"; shift ;;
@@ -268,6 +273,26 @@ validate_inputs() {  # validação TOTAL antes da primeira mutação (FR-015/R12
     if ! printf '%s' "$APP_PORT" | grep -qE '^[0-9]+$' || [ "$APP_PORT" -lt 1 ] || [ "$APP_PORT" -gt 65535 ]; then
         die "Porta da aplicação inválida: $APP_PORT (1–65535)"
     fi
+
+    # Ponto 3 (README): validar APP_HOST como IP/hostname ANTES de qualquer
+    # mutação (antes o erro só aparecia no bind do serviço/health check)
+    case "$APP_HOST" in
+        ''|*[!A-Za-z0-9.-]*)
+            die "Host da aplicação inválido: '$APP_HOST' (use IPv4, hostname ou 0.0.0.0)" ;;
+        [0-9]*.[0-9]*.[0-9]*.[0-9]*)
+            validate_identifier "Host da aplicação (IP)" "$APP_HOST" '^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+            local _h_oct
+            for _h_oct in ${APP_HOST//./ }; do
+                [ "$_h_oct" -le 255 ] || die "Host da aplicação inválido: octeto $_h_oct fora de 0–255 em '$APP_HOST'"
+            done
+            ;;
+        *)
+            validate_identifier "Host da aplicação (hostname)" "$APP_HOST" '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$'
+            case "$APP_HOST" in
+                *..*) die "Host da aplicação inválido: '..' não é permitido em '$APP_HOST'" ;;
+            esac
+            ;;
+    esac
 
     # D2/FR-015: recriação de banco é PROIBIDA em modo não interativo
     if [ "$RECREATE_DB" = "true" ] && [ "$NON_INTERACTIVE" = "true" ]; then
@@ -379,6 +404,22 @@ check_distro() {
 
 check_connectivity() {
     STEP="Verificação de conectividade"
+    # Ponto 4 (README): modo air-gapped (--wheel-dir + fonte local) não exige
+    # acesso à rede — valida a fonte local e omite as checagens de conectividade
+    if [ -n "$WHEEL_DIR" ]; then
+        [ -d "$WHEEL_DIR" ] || die "--wheel-dir aponta para um diretório inexistente: $WHEEL_DIR"
+        [ -n "$(ls "$WHEEL_DIR"/*.whl 2>/dev/null)" ] || die "--wheel-dir não contém arquivos .whl: $WHEEL_DIR"
+        if [ -d "$REPO_URL/.git" ]; then
+            ok "Modo OFFLINE (air-gapped): fonte local '$REPO_URL' + wheels de '$WHEEL_DIR' — checagem de rede omitida."
+            if command -v apt-get >/dev/null 2>&1; then
+                ok "apt disponível."
+            else
+                die "apt-get não encontrado — gerenciador de pacotes esperado na base Debian."
+            fi
+            return
+        fi
+        die "--wheel-dir exige fonte local: use --repo /caminho/para/repo (com .git) em vez de '$REPO_URL'."
+    fi
     command -v git >/dev/null 2>&1 || apt-get install -y git >/dev/null 2>&1 || true
     if git ls-remote --heads "$REPO_URL" "$BRANCH" >/dev/null 2>&1; then
         ok "Repositório acessível e branch '$BRANCH' existe."
@@ -697,8 +738,16 @@ ensure_repo() {
         die "$INSTALL_DIR existe, não está vazio e NÃO é um clone Git válido. Decida o destino do conteúdo (mova/remova manualmente) e reexecute — o instalador não sobrescreve."
     fi
     $SUDO mkdir -p "$(dirname "$INSTALL_DIR")"
-    $SUDO git clone --branch "$BRANCH" --single-branch "$REPO_URL" "$INSTALL_DIR"
-    ok "Repositório clonado (branch $BRANCH) em $INSTALL_DIR."
+    # Ponto 4 (README): fonte local (air-gapped) — cp -a preserva o .git, de modo
+    # que a reexecução reutilize o diretório como clone válido (ensure_repo)
+    if [ -d "$REPO_URL/.git" ]; then
+        $SUDO mkdir -p "$INSTALL_DIR"
+        $SUDO cp -a "$REPO_URL"/. "$INSTALL_DIR/"
+        ok "Fonte local copiada de $REPO_URL (branch de trabalho: $BRANCH) para $INSTALL_DIR."
+    else
+        $SUDO git clone --branch "$BRANCH" --single-branch "$REPO_URL" "$INSTALL_DIR"
+        ok "Repositório clonado (branch $BRANCH) em $INSTALL_DIR."
+    fi
 }
 
 # ----------------------------------------------------------------------------
@@ -721,12 +770,21 @@ ensure_venv() {
         $SUDO rm -rf "$INSTALL_DIR/.venv"
     fi
     $SUDO python3 -m venv "$INSTALL_DIR/.venv"
-    $SUDO "$INSTALL_DIR/.venv/bin/python" -m pip install --upgrade pip >/dev/null
+    # Ponto 4 (README): em modo offline não há como atualizar o pip (exigiria
+    # PyPI) — o pip do venv embutido já atende para instalar wheels locais
+    if [ -z "$WHEEL_DIR" ]; then
+        $SUDO "$INSTALL_DIR/.venv/bin/python" -m pip install --upgrade pip >/dev/null
+    fi
     # Saída VISÍVEL (sem >/dev/null): pip demora minutos e output silencioso parece
     # travamento — que convida a uma 2ª execução concorrente (causa real de
     # crash-loop ENOENT observada em instalação real)
-    info "Instalando requirements.txt (do repositório recém-clonado; leva alguns minutos)..."
-    $SUDO "$INSTALL_DIR/.venv/bin/python" -m pip install --progress-bar off -r "$INSTALL_DIR/requirements.txt" >&2
+    if [ -n "$WHEEL_DIR" ]; then
+        info "Instalando requirements.txt OFFLINE (wheels de $WHEEL_DIR; leva alguns minutos)..."
+        $SUDO "$INSTALL_DIR/.venv/bin/python" -m pip install --progress-bar off --no-index --find-links "$WHEEL_DIR" -r "$INSTALL_DIR/requirements.txt" >&2
+    else
+        info "Instalando requirements.txt (do repositório recém-clonado; leva alguns minutos)..."
+        $SUDO "$INSTALL_DIR/.venv/bin/python" -m pip install --progress-bar off -r "$INSTALL_DIR/requirements.txt" >&2
+    fi
     # FR-009: validação final = imports do próprio README (roda como o usuário do serviço,
     # pois o venv é dele; o chown ocorre depois, em ensure_service_user)
     "$INSTALL_DIR/.venv/bin/python" -c 'import fastapi, sqlalchemy, pymysql, ldap3, reportlab, openpyxl, dotenv'

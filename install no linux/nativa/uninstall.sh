@@ -17,6 +17,11 @@
 #   - detecta o banco/usuário a partir do .env instalado (não hardcode);
 #   - idempotente: pode ser executado repetidamente; nada de 404/erros feios.
 #
+# NOTA DE ROBUSTEZ: todo `read` tratado como decisão tem proteção contra EOF
+# (`|| true` + decisão de PRESERVAR/cancelar). Sem isso, uma entrada truncada
+# (pipe fechado, SSH desconectado) dispararia set -e → trap de erro, com
+# "falha" feia em vez de cancelamento limpo. Padrão: EOF ⇒ nada destrutivo.
+#
 # Uso:
 #   sudo bash uninstall.sh                        # interativo (pergunta tudo)
 #   sudo bash uninstall.sh --yes                  # remove app+serviço+usuário Linux;
@@ -128,7 +133,8 @@ confirm() {  # $1=pergunta → 0 se confirmado (respeita --yes)
     fi
     prompt_printf "$1"
     local ans
-    read -r ans
+    # EOF/pipe fechado ⇒ NÃO confirmar (ler status do read antes de usar)
+    read -r ans || ans=""
     case "$ans" in
         s|S|sim|SIM|y|Y) return 0 ;;
         *) return 1 ;;
@@ -209,12 +215,12 @@ remove_database() {
         warn "O .env instalado apontava para o banco '$DB_NAME' (usuário '$DB_USER')."
     else
         printf 'Nome do banco da aplicação a remover: ' >&2
-        read -r DB_NAME
+        read -r DB_NAME || DB_NAME=""
         [ -n "$DB_NAME" ] || { warn "Nenhum banco informado — preservado."; return; }
     fi
     # Confirmação OBRIGATÓRIA (mesmo com --yes): digitar o nome do banco
     prompt_printf "Digite o nome do banco para CONFIRMAR a remoção de '$DB_NAME' e seus dados (vazio = preservar): "
-    read -r c1
+    read -r c1 || c1=""
     if [ "$c1" != "$DB_NAME" ]; then
         warn "Banco PRESERVADO (confirmação não recebida)."
         return
@@ -225,7 +231,7 @@ remove_database() {
     ok "Banco '$DB_NAME' removido."
     if [ -n "$DB_USER" ]; then
         prompt_printf "Remover também o usuário do banco '$DB_USER'@'localhost'? (s/N): "
-        read -r c2
+        read -r c2 || c2=""
         case "$c2" in
             s|S|sim|SIM|y|Y)
                 "$BANCO_CLIENT_CMD" -e "DROP USER IF EXISTS '$(sql_escape "$DB_USER")'@'localhost';"
@@ -247,10 +253,10 @@ purge_mariadb() {  # DESTRUTIVO: TODOS os bancos do servidor — dupla confirma�
     warn "não apenas o do SisPatrimônio. IRREVERSÍVEL."
     warn "================================================================"
     prompt_printf "Digite EXATAMENTE 'PURGAR-MARIADB' para confirmar: "
-    read -r c1
+    read -r c1 || c1=""
     [ "$c1" = "PURGAR-MARIADB" ] || { warn "MariaDB PRESERVADO."; return; }
     prompt_printf "Confirmar novamente (s/N): "
-    read -r c2
+    read -r c2 || c2=""
     case "$c2" in
         s|S|sim|SIM|y|Y) ;;
         *) warn "MariaDB PRESERVADO."; return ;;
@@ -284,7 +290,7 @@ main() {
     info "SisPatrimônio Pro — Desinstalador Linux v${VERSION} ($(date '+%Y-%m-%d %H:%M:%S'))"
     if [ "$ASSUME_YES" != "true" ]; then
         prompt_printf "Desinstalar o SisPatrimônio Pro deste servidor? (s/N): "
-        read -r gate
+        read -r gate || gate=""
         case "$gate" in
             s|S|sim|SIM|y|Y) ;;
             *) die "Desinstalação cancelada. Nada foi alterado." ;;

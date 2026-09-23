@@ -99,6 +99,27 @@ Documentação e análise aprofundada dos instaladores de produção do SisPatri
 
   Acesso: `http://<ip-do-servidor>:8000` · API: `/docs` · Health: `/health`. As credenciais ficam **apenas** no `.env` (0600) — nunca no resumo nem no log.
 
+  #### Desinstalação (uninstall-docker.sh)
+
+  ```bash
+  sudo bash uninstall-docker.sh                  # interativo (pergunta tudo)
+  sudo bash uninstall-docker.sh --yes            # containers+diretório+imagens órfãs;
+                                                 # volume do banco AINDA exige digitar o nome
+  sudo bash uninstall-docker.sh --keep-db        # preserva o volume do banco (dados)
+  sudo bash uninstall-docker.sh --purge-docker   # também remove as imagens (dupla confirmação)
+  ```
+
+  Ordem da remoção (idempotente — pode ser reexecutado):
+
+  1. **Containers** (`compose down` — app + db)
+  2. **Volume do banco `db-data`** — TODOS os dados: exige **digitar o nome do banco** (mesmo com `--yes`)
+  3. **Volume `app-data`** — backups/logs: confirmação própria (separada da decisão do banco)
+  4. **Diretório da aplicação** — código, `.env` com credenciais (mesma confirmação do nativo)
+  5. **Imagens do projeto** — apenas com `--purge-docker` + dupla confirmação (`PURGAR-IMAGENS`); a `mariadb:11` só é removida se órfã
+  6. **Log do instalador** (`/var/log/sispatrimonio-install-docker.log`)
+
+  > O Docker Engine (daemon) **nunca** é removido — é infraestrutura de uso geral do servidor. O banco/volume são detectados do compose + `.env` instalados (não hardcoded); se o compose/.env não existirem, o volume é inferido do diretório e o nome do banco é perguntado.
+
   ──────
   ## 🖥️ Instalação Nativa (install.sh) — Análise Aprofundada
 
@@ -172,7 +193,7 @@ Documentação e análise aprofundada dos instaladores de produção do SisPatri
                                                                                                                                                                                            
   Apesar da alta qualidade do código, há detalhes técnicos a observar:                                                                                                                     
                                                                                                                                                                                            
-  #### 1. Uso do Idioma cmd1 && cmd2 || cmd3 (SC2015 do ShellCheck)                                                                                                                        
+  #### 1. Uso do Idioma cmd1 && cmd2 || cmd3 (SC2015 do ShellCheck) — ✅ já aplicado no código atual                                                                                                                        
                                                                                                                                                                                            
   Em várias partes do script (notadamente em detect_host e post_install_checks), encontra-se a construção:                                                                                 
                                                                                                                                                                                            
@@ -189,7 +210,7 @@ Documentação e análise aprofundada dos instaladores de produção do SisPatri
     fi
   
 
-  #### 2. Expressão de Regex no SHOW GRANTS em security_self_check
+  #### 2. Expressão de Regex no SHOW GRANTS em security_self_check — ✅ já aplicado no código atual
   
   Na linha:
   
@@ -203,16 +224,32 @@ Documentação e análise aprofundada dos instaladores de produção do SisPatri
     grep -cE 'ON (`\*`|\*)\.(`\*`|\*)'
   
 
-  #### 3. Validação Sintática de APP_HOST
+  #### 3. Validação Sintática de APP_HOST — ✅ CORRIGIDO (v1.1.0)
   
   • A variável APP_PORT é validada rigorosamente (entre 1 e 65535 com regex numérica), mas APP_HOST não passa por validação no validate_inputs. Se um operador informar um host inválido   
   via --app-host, o erro só será notado quando a aplicação subir ou no momento do teste de bind.
   
-  #### 4. Ambientes Air-Gapped (Sem Acesso Direto à Internet)
+  #### 4. Ambientes Air-Gapped (Sem Acesso Direto à Internet) — ✅ CORRIGIDO (v1.1.0)
   
   • O instalador assume conexão direta e irrestrita com a internet (git ls-remote, git clone e pip install). Se o script for executado em um ambiente corporativo isolado (on-premises     
   fechado com proxy corporativo ou sem acesso externo direto), ele falhará na etapa de pré-requisitos (check_connectivity). Ter suporte a parâmetros como --wheel-dir ou repositórios      
   locais seria uma adição valiosa para ambientes regulados.
+
+  > **Status (v1.1.0 do instalador):** os dois pontos restantes foram implementados:
+  >
+  > • **Ponto 3** — `validate_inputs` valida `APP_HOST` antes de qualquer mutação: rejeita
+  >   vazio e caracteres fora de `[A-Za-z0-9.-]`; se o valor tem forma de IPv4, exige 4 octetos
+  >   numéricos ≤ 255; caso contrário, exige hostname válido (sem `..`, sem `-` nas pontas).
+  >   Falha cedo com `die` (exit 2) — nunca mais descoberta tarde no bind do serviço.
+  >
+  > • **Ponto 4** — nova flag `--wheel-dir <caminho>` para instalação 100% OFFLINE (air-gapped):
+  >   `sudo bash install.sh --wheel-dir /mnt/wheels --repo /mnt/repo`. Com `--wheel-dir`:
+  >   (a) `check_connectivity` omite o `git ls-remote` e valida a fonte local (`--repo` deve
+  >   apontar para um diretório com `.git`) e a presença de arquivos `.whl`;
+  >   (b) `ensure_repo` copia a fonte local com `cp -a` (preserva o `.git`, mantendo a
+  >   idempotência de reexecução); (c) `ensure_venv` instala com
+  >   `pip --no-index --find-links "$WHEEL_DIR"` e pula o upgrade do pip (que exigiria PyPI).
+  >   Sem `--wheel-dir`, o comportamento online permanece idêntico ao anterior.
   ──────
   ### Resumo do Veredito
   
