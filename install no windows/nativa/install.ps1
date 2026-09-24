@@ -226,6 +226,8 @@ function Validate-Inputs {
     if (-not $ServiceName) { $script:ServiceName = $DefaultServiceName }
     if (-not $ServiceUser) { $script:ServiceUser = $DefaultServiceUser }
 
+    $script:VenvPython = Join-Path $script:InstallDir '.venv\Scripts\python.exe'
+
     Test-Identifier 'Nome do banco'    $DbName      '^[A-Za-z_][A-Za-z0-9_]*$'
     Test-Identifier 'Usuario do banco' $DbUser      '^[A-Za-z_][A-Za-z0-9_]*$'
     Test-Identifier 'Nome da tarefa'   $ServiceName '^[a-z][a-z0-9-]*$'
@@ -401,7 +403,7 @@ function Ensure-Packages {
     ok 'Git disponivel.'
 
     if (-not $DbServiceName) {
-        if (-not (Install-WinGetPackage 'MariaDB.MariaDB.11.4' 'MariaDB 11.4')) {
+        if (-not (Install-WinGetPackage 'MariaDB.Server' 'MariaDB Server')) {
             die 'MariaDB nao instalado. Instale o MariaDB manualmente (mariadb.org) e reexecute - o instalador e idempotente.'
         }
         $svc = Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(MariaDB|MySQL)' } | Select-Object -First 1
@@ -592,7 +594,10 @@ function Ensure-Repo {
     if ((Test-Path $InstallDir) -and (Get-ChildItem -Force $InstallDir -ErrorAction SilentlyContinue | Measure-Object).Count -gt 0) {
         die "$InstallDir existe, nao esta vazio e NAO e um clone Git valido. Decida o destino do conteudo (mova/remova manualmente) e reexecute - o instalador nao sobrescreve."
     }
-    New-Item -ItemType Directory -Force -Path (Split-Path $InstallDir -Parent) -ErrorAction Stop | Out-Null
+    $parentDir = Split-Path $InstallDir -Parent
+    if ($parentDir -and -not (Test-Path $parentDir)) {
+        New-Item -ItemType Directory -Force -Path $parentDir -ErrorAction Stop | Out-Null
+    }
     & git clone --branch $BranchValue --single-branch $RepoUrl $InstallDir 2>&1 | ForEach-Object { Write-Host "    $_" }
     if ($LASTEXITCODE -ne 0) { die 'Falha no git clone - verifique rede/credenciais e reexecute.' }
     ok "Repositorio clonado (branch $BranchValue) em $InstallDir."
@@ -601,8 +606,6 @@ function Ensure-Repo {
 # ----------------------------------------------------------------------------
 # T008 - venv + requirements (FR-009, R8)
 # ----------------------------------------------------------------------------
-$script:VenvPython = Join-Path $InstallDir '.venv\Scripts\python.exe'
-
 function Test-VenvOk {
     if (-not (Test-Path $VenvPython)) { return $false }
     & $VenvPython -m pip --version *> $null

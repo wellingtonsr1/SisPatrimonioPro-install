@@ -472,7 +472,10 @@ function Ensure-Repo {
     if ((Test-Path $InstallDir) -and (Get-ChildItem -Force $InstallDir -ErrorAction SilentlyContinue | Measure-Object).Count -gt 0) {
         die "$InstallDir existe, nao esta vazio e NAO e um clone Git valido. Decida o destino do conteudo (mova/remova manualmente) e reexecute - o instalador nao sobrescreve."
     }
-    New-Item -ItemType Directory -Force -Path (Split-Path $InstallDir -Parent) -ErrorAction Stop | Out-Null
+    $parentDir = Split-Path $InstallDir -Parent
+    if ($parentDir -and -not (Test-Path $parentDir)) {
+        New-Item -ItemType Directory -Force -Path $parentDir -ErrorAction Stop | Out-Null
+    }
     & git clone --branch $BranchValue --single-branch $RepoUrl $InstallDir 2>&1 | ForEach-Object { Write-Host "    $_" }
     if ($LASTEXITCODE -ne 0) { die 'Falha no git clone - verifique rede/credenciais e reexecute.' }
     ok "Repositorio clonado (branch $BranchValue) em $InstallDir."
@@ -882,7 +885,7 @@ function Print-Summary {
     Write-Host ''
     Write-Host ('  BACKUP DO BANCO (exemplo - senha em ' + (Join-Path $InstallDir '.env') + ')') -ForegroundColor White
     Write-Host ("    cd `"$InstallDir`"")
-    Write-Host '    $root = (Get-Content .env | Where-Object { $_ -match ''^DB_ROOT_PASSWORD='' }) -replace ''^DB_ROOT_PASSWORD='',''''
+    Write-Host "    `$root = (Get-Content .env | Where-Object { `$_ -match '^DB_ROOT_PASSWORD=' }) -replace '^DB_ROOT_PASSWORD=',''"
     Write-Host '    $env:MYSQL_PWD = $root'
     Write-Host ("    docker compose exec -T -e MYSQL_PWD=`$root db mariadb-dump -uroot $DbNameResolved > backup-`$(Get-Date -Format yyyy-MM-dd).sql")
     Write-Host ''
