@@ -757,13 +757,20 @@ function Get-DbServerKind {
 function Build-DatabaseUrl {
     $script:DbServerKind = Get-DbServerKind
     if ($script:DbServerKind -eq 'mysql') { $script:DbScheme = 'mysql+pymysql' } else { $script:DbScheme = 'mariadb+pymysql' }
+    # Fonte ÚNICA (feature 061/T032, FR-010): scripts/monta_database_url.py.
+    # Credenciais por VARIÁVEL DE AMBIENTE (nunca argv — SR-001); a URL é
+    # capturada — NUNCA impressa/logada (contém a senha).
+    $helper = Join-Path $InstallDir 'scripts\monta_database_url.py'
+    if (-not (Test-Path $helper)) { die "Helper de montagem da DATABASE_URL ausente: $helper (o snapshot do PRO deve conter scripts/ — publicação da 061). Reexecute após nova publicação." }
     $env:SP_DBUSER = $DbUser; $env:SP_DBPASS = $DbPassword
     $env:SP_DBHOST = $DbHost; $env:SP_DBPORT = $DbPort; $env:SP_DBNAME = $DbName
     $env:SP_DBSCHEME = $script:DbScheme
     try {
-        $code = 'import os; from urllib.parse import quote; print(os.environ["SP_DBSCHEME"] + "://%s:%s@%s:%s/%s" % (quote(os.environ["SP_DBUSER"], safe=""), quote(os.environ["SP_DBPASS"], safe=""), os.environ["SP_DBHOST"], os.environ["SP_DBPORT"], os.environ["SP_DBNAME"]))'
-        $url = (& $VenvPython -c $code)
-        if (-not $url -or $LASTEXITCODE -ne 0) { die 'Falha ao montar DATABASE_URL (percent-encoding via Python).' }
+        Push-Location $InstallDir
+        try {
+            $url = (& $VenvPython 'scripts\monta_database_url.py')
+        } finally { Pop-Location }
+        if (-not $url -or $LASTEXITCODE -ne 0) { die 'Falha ao montar DATABASE_URL (percent-encoding via scripts/monta_database_url.py).' }
         $script:DatabaseUrlBuilt = ([string]$url).Trim()
     } finally {
         Remove-Item Env:\SP_DBUSER, Env:\SP_DBPASS, Env:\SP_DBHOST, Env:\SP_DBPORT, Env:\SP_DBNAME, Env:\SP_DBSCHEME -ErrorAction SilentlyContinue

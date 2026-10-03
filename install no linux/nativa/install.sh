@@ -926,16 +926,23 @@ ENVEOF
 }
 
 build_database_url() {  # percent-encoding programático (nunca montagem manual — R5/R6)
+    # Fonte ÚNICA (feature 061/T032, FR-010): scripts/monta_database_url.py.
+    # Credenciais por VARIÁVEL DE AMBIENTE (nunca argv — SR-001); a URL sai na
+    # stdout e é capturada — NUNCA impressa/logada (contém a senha).
     # quote(safe='') e NÃO quote_plus: espaço vira %20 (quote_plus usaria '+' —
     # que o parse de URL do SQLAlchemy NÃO decodifica como espaço, corrompendo
     # a senha e causando Access denied); '@' → %40, '#' → %23 etc. ficam ok.
-    DATABASE_URL_BUILT="$("$INSTALL_DIR/.venv/bin/python" - "$DB_USER" "$DB_PASSWORD" "$DB_HOST" "$DB_PORT" "$DB_NAME" <<'PYEOF'
-import sys
-from urllib.parse import quote
-user, pwd, host, port, db = sys.argv[1:6]
-print(f"mariadb+pymysql://{quote(user, safe='')}:{quote(pwd, safe='')}@{host}:{port}/{db}")
-PYEOF
-)"
+    local helper="$INSTALL_DIR/scripts/monta_database_url.py"
+    if [ ! -f "$helper" ]; then
+        die "Helper de montagem da DATABASE_URL ausente: $helper — a dev publicada no PRO precisa conter scripts/ (publicação da 061). Reexecute após nova publicação."
+    fi
+    DATABASE_URL_BUILT="$(
+        SP_DBSCHEME="mariadb+pymysql" \
+        SP_DBUSER="$DB_USER" SP_DBPASS="$DB_PASSWORD" \
+        SP_DBHOST="$DB_HOST" SP_DBPORT="$DB_PORT" SP_DBNAME="$DB_NAME" \
+        "$INSTALL_DIR/.venv/bin/python" "$helper"
+    )" || die "Falha ao montar a DATABASE_URL (scripts/monta_database_url.py) — veja a mensagem acima."
+    [ -n "$DATABASE_URL_BUILT" ] || die "DATABASE_URL vazia após a montagem — verifique as credenciais informadas."
 }
 
 # ----------------------------------------------------------------------------
