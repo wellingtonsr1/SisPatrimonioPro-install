@@ -137,7 +137,7 @@ Documentação e análise aprofundada dos instaladores de produção do SisPatri
   #### Requisitos
 
   - Windows 10/11 ou Windows Server 2019+ · PowerShell 5.1 (ou 7) **executando como Administrador**
-  - Variante nativa: conexão à internet (winget instala Python 3.12, Git e MariaDB 11.4 se ausentes)
+  - Variante nativa: conexão à internet (winget instala Python 3.12, Git e **MySQL Server nativo** — `Oracle.MySQL` — se ausentes; serviços MariaDB/MySQL já presentes são reutilizados; um serviço apontando para binário do **XAMPP nunca é reutilizado**)
   - Variante Docker: Docker Desktop em execução (ou Docker Engine + Compose v2); Git no host
 
   #### Uso — instalação nativa
@@ -153,7 +153,7 @@ Documentação e análise aprofundada dos instaladores de produção do SisPatri
   powershell -ExecutionPolicy Bypass -File install.ps1 -AppPort 8080 -InstallDir D:\SisPatrimonioPro
   ```
 
-  O que o instalador faz (15 etapas, espelhando o `install.sh`): valida entradas e privilégios de administrador, detecta Python/Git/MariaDB (instala via winget o que faltar, inclusive o serviço do banco), clona o repositório, cria o venv e instala o `requirements.txt` (validação por imports), monta a `DATABASE_URL` com percent-encoding via Python (senha nunca em argv/log), cria/reutiliza banco + usuário (privilégios só no banco da aplicação — SR-003), gera o `.env` com ACL restrita, testa a conexão via engine do projeto, registra a **Tarefa Agendada** (dispara no boot, reinicia até 3x em falha, roda como SYSTEM), para a tarefa de rodada anterior (evita corrida com o `init_db`), executa o `init_db()`, faz start + polling de `/health` (até 120s), roda a bateria pós-instalação, a auditoria de segurança e cria a regra de firewall de entrada.
+  O que o instalador faz (16 etapas, espelhando o `install.sh`): valida entradas e privilégios de administrador, detecta Python/Git/servidor de banco (instala via winget o que faltar — banco nativo = **MySQL Server**, `Oracle.MySQL`; serviços MariaDB/MySQL existentes são reutilizados, **nunca** um serviço do XAMPP — FR-013), clona o repositório, cria o venv e instala o `requirements.txt` (validação por imports), gera os **certificados TLS** (features 056/061 — `data\ssl`, reutilizados em reexecuções), monta a `DATABASE_URL` com percent-encoding via Python com o **scheme do servidor real** (`mariadb+pymysql` para MariaDB, `mysql+pymysql` para MySQL — detectado por `SELECT VERSION()`), cria/reutiliza banco + usuário (privilégios só no banco da aplicação — SR-003), gera o `.env` com ACL restrita (incluindo `APP_SSL_CERTFILE`/`APP_SSL_KEYFILE`/`AUTH_COOKIE_SECURE=true`), testa a conexão via engine do projeto, registra a **Tarefa Agendada** (dispara no boot, reinicia até 3x em falha, roda como SYSTEM), para a tarefa de rodada anterior (evita corrida com o `init_db`), executa o `init_db()`, faz start + polling de `/health` **via HTTPS** (até 120s), roda a bateria pós-instalação, a auditoria de segurança e cria a regra de firewall de entrada.
 
   #### Uso — variante Docker
 
@@ -184,7 +184,7 @@ Documentação e análise aprofundada dos instaladores de produção do SisPatri
   | `--service-name` / `--service-user` | `-ServiceName` / `-ServiceUser` | tarefa agendada; default: `sispatrimoniopro` / `SYSTEM` |
   | `--recreate-db` | `-RecreateDb` | APAGA o banco (dupla confirmação; proibido com `-NonInteractive`) |
   | `--reset-db` (Docker) | `-ResetDb` | APAGA o **volume** do banco (dupla confirmação; `app-data` preservado) |
-  | `--update` | `-Update` | reservado — ainda não implementado (NFR-005) |
+  | `--update` | `-Update` | atualiza a instalação existente (código + dependências + schema + reinício; `.env` e dados preservados) — veja **🔄 Atualização da instalação** |
 
   #### Equivalências e divergências técnicas (necessárias no Windows)
 
@@ -192,7 +192,7 @@ Documentação e análise aprofundada dos instaladores de produção do SisPatri
   |---|---|---|
   | systemd (unit `sispatrimoniopro.service`) | **Tarefa Agendada** (boot + restart em falha, como `SYSTEM`) | substitui o serviço; `Restart=on-failure` → `RestartCount 3` |
   | `.env` 0600 (`umask 077`) | **ACL restrita** via `icacls /inheritance:r` (apenas SYSTEM, Administradores e usuário atual) | mesmo isolamento, mecanismo nativo |
-  | `apt install` (Python/Git/MariaDB) | **winget** (`Python.Python.3.12`, `Git.Git`, `MariaDB.MariaDB.11.4`) | idempotente — só instala o que falta |
+  | `apt install` (Python/Git/MariaDB) | **winget** (`Python.Python.3.12`, `Git.Git`, `Oracle.MySQL` — MySQL Server nativo; MariaDB/MySQL pré-existentes são reutilizados; serviço do XAMPP nunca) | idempotente — só instala o que falta |
   | admin do banco via socket unix_auth | senha de **root via TCP**: variável de ambiente `SISPAT_DB_ADMIN_PASSWORD` (não interativo) ou coletada sem eco | divergência documentada no cabeçalho do script |
   | — | **Regra de firewall** de entrada criada para a porta da app | o Windows bloqueia portas por padrão (o Linux não) |
   | usuário do banco `'usuario'@'localhost'` | usuários para `localhost` **e** `127.0.0.1` | conexão TCP no Windows |
@@ -363,3 +363,59 @@ Documentação e análise aprofundada dos instaladores de produção do SisPatri
 
   > **Nota:** a variante Docker (`install-docker.sh`) herda deliberadamente estes mesmos princípios — idempotência, sigilo de credenciais em argv/log, `.env` 0600, confirmação dupla para ações destrutivas e bateria pós-instalação — trocando systemd/venv/MariaDB nativo pelos containers definidos no `docker-compose.yml` do repositório. Veja a seção **Instalação via Docker** no início deste documento. O mesmo vale para as versões Windows (PowerShell) em `install no windows/` — herdam exatamente os mesmos princípios, confirmações e baterias de verificação, com as adaptações de plataforma documentadas na seção **Instalação no Windows**.
 
+
+---
+
+## HTTPS nativo (features 056/061)
+
+A instalação nativa (Linux e Windows) ativa **TLS no próprio servidor da aplicação** (Uvicorn) — sem proxy, sem redirect. O certificado é gerado pelo mecanismo existente da 056 (`scripts/gera_cert_dev.py`, openssl CLI) durante a instalação:
+
+- **Onde ficam**: `<diretório da instalação>/data/ssl/` — `ca.crt`, `ca.key`, `server.crt`, `server.key` (fora do versionamento; a chave privada **nunca** é publicada).
+- **SAN do certificado**: `IP:<ip-da-LAN>`, `DNS:localhost`, `DNS:<hostname>`, `DNS:sispatrimoniopro.local`.
+- **.env**: o instalador grava `APP_SSL_CERTFILE=data/ssl/server.crt`, `APP_SSL_KEYFILE=data/ssl/server.key` e `AUTH_COOKIE_SECURE=true` (obrigatório com HTTPS ativo — sem isso o login para).
+- **URL final**: `https://<ip>:8000` (porta da aplicação; sem porta HTTP separada; sem redirect).
+- **Confiar no certificado nos aparelhos (1×)**: importar `data/ssl/ca.crt` como CA confiável (roteiro por plataforma em `docs/HTTPS_LOCAL.md` da aplicação).
+- **Regenerar** (ex.: IP da LAN mudou): Linux `sudo bash install.sh --regenerate-cert` · Windows `powershell -ExecutionPolicy Bypass -File install.ps1 -RegenerateCert` — a CA é regerada e precisa ser **reimportada** nos aparelhos. Sem a flag, certificados existentes são reutilizados (reinstalação/atualização não invalidam o HTTPS).
+- Firewall: a porta da aplicação é liberada automaticamente (regra nomeada idempotente — Linux via ufw quando ativo; Windows via `New-NetFirewallRule`).
+
+──────
+## 🔄 Atualização da instalação (feature 061 — CS-5)
+
+A opção "reservada" virou fluxo real de atualização, com as mesmas garantias de idempotência e sigilo do instalador:
+
+```bash
+# Linux
+sudo bash install.sh --update
+```
+
+```powershell
+# Windows
+powershell -ExecutionPolicy Bypass -File install.ps1 -Update
+```
+
+O que a atualização faz (8 etapas): valida que a instalação existe (clone Git + venv + `.env` + `run.py`; a porta real é lida do `.env`), verifica conectividade, **`git fetch` + `pull --ff-only`** (nunca merge/force), sincroniza dependências (`pip install -r requirements.txt`, idempotente), garante usuário/permissões do serviço (Linux), para o serviço/tarefa de rodada anterior (evita corrida com o `init_db`), executa `init_db()` (migrações de schema) e reinicia com polling de `/health` **via HTTPS** + bateria pós-atualização.
+
+Garantias:
+
+- **`.env` e dados de produção NUNCA são alterados** — a atualização não toca banco, `.env`, certificados TLS nem `data/`.
+- **Árvore suja ABORTA** — se o clone tiver alterações locais (`git status` não vazio), a atualização para ANTES de qualquer mutação: o instalador nunca reverte código; resolva (commit/stash) e reexecute.
+- **Divergência de histórico ABORTA** — `pull --ff-only` falha limpa em clone divergido; nenhuma alteração parcial é aplicada.
+- Código já atualizado → a execução é no-op seguro (reexecutável à vontade).
+- Requisito: acesso à internet ao repositório (git) e ao PyPI (pip) — não é suportado com `--wheel-dir`.
+- Flags incompatíveis (recusadas antes de qualquer mutação): `--recreate-db`/`-RecreateDb` (a atualização nunca apaga dados), `--db-password`/`--generate-db-password`/`-DbPassword`/`-GenerateDbPassword` (a senha vigente vive no `.env`), `--regenerate-cert`/`-RegenerateCert` (o certificado TLS existente é reutilizado).
+
+──────
+## 🗄️ Banco de dados: versões suportadas e XAMPP (feature 061 — FR-013)
+
+Faixa de versões suportada (validada pelo instalador contra o **servidor real**, via `SELECT VERSION()`):
+
+| SGBD | Versão mínima | Por quê |
+|---|---|---|
+| MariaDB (Linux nativo) | **10.5+** | idempotência DDL (`ADD COLUMN IF NOT EXISTS`) da revisão de migração 0002 |
+| MySQL (Windows nativo) | **8.0+** | revisão 0002 usa caminho condicional via `information_schema` (MySQL não suporta `IF NOT EXISTS` em DDL); autenticação `caching_sha2_password` (exige o pacote `cryptography`, já no `requirements.txt`) |
+
+Versão inferior à mínima **interrompe a instalação com mensagem explícita** orientando a atualização do servidor — nada é montado pela metade.
+
+**XAMPP não é suportado como banco do sistema.** Se o único serviço de banco detectado no Windows aponta para binário em `C:\xampp`, o instalador o recusa (avisa e instala **MySQL Server nativo** via winget `Oracle.MySQL`); o pacote winget instala o *MySQL Installer* — se o serviço do servidor ainda não existir após a instalação, o instalador orienta a configurá-lo pelo próprio MySQL Installer (porta 3306, serviço automático, senha de root) e reexecutar (idempotente). O scheme da `DATABASE_URL` acompanha o servidor detectado: `mariadb+pymysql://` para MariaDB, `mysql+pymysql://` para MySQL — o mesmo código roda nos dois apenas via configuração.
+
+> Referências históricas ao XAMPP em documentos antigos permanecem apenas como registro — nenhuma etapa operacional de instalação depende dele.

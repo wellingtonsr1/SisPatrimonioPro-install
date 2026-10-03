@@ -20,7 +20,7 @@
 #   sudo bash install.sh
 #   sudo bash install.sh --non-interactive --db-name X --db-user Y \
 #        --generate-db-password
-#   sudo bash install.sh --update   # reservado (ainda não implementado)
+#   sudo bash install.sh --update   # atualiza código/dependências/schema (mantém .env e dados)
 #
 # Contrato completo: specs/027-instalador-producao-linux/contracts/installer-contract.md
 # ============================================================================
@@ -63,6 +63,8 @@ DB_HOST="$DEFAULT_DB_HOST"
 DB_PORT="$DEFAULT_DB_PORT"
 APP_HOST="$DEFAULT_APP_HOST"
 APP_PORT="$DEFAULT_APP_PORT"
+REGENERATE_CERT="false"   # --regenerate-cert: regera CA+cert TLS (feature 061)
+UPDATE="false"            # --update: atualiza instalação existente (feature 061/CS-5)
 SERVICE_NAME="$DEFAULT_SERVICE_NAME"
 SERVICE_USER="$DEFAULT_SERVICE_USER"
 SERVICE_GROUP="$DEFAULT_SERVICE_GROUP"
@@ -71,7 +73,7 @@ DB_PASSWORD_CHANGED="false"   # true quando o usuário do banco foi criado/recri
 
 STEP=""
 STEP_NO=0
-TOTAL_STEPS=15
+TOTAL_STEPS=16
 BANCO_SERVICE_DETECTED=""
 BANCO_CLIENT_CMD=""
 
@@ -215,7 +217,10 @@ Uso: sudo bash install.sh [opções]
   --service-user <usuário>    Usuário Linux do serviço (default: ${DEFAULT_SERVICE_USER})
   --recreate-db               APAGA e recria o banco da aplicação (SÓ interativo;
                               dupla confirmação; proibido com --non-interactive)
-  --update                    Reservado: ainda não implementado (NFR-005)
+  --regenerate-cert           Regenera CA+certificado TLS (reimportar ca.crt nos clientes)
+  --update                    Atualiza uma instalação existente (git fetch +
+                              pull --ff-only, pip, init_db, reinício, health);
+                              .env e dados preservados (nunca reverte código)
   --help                      Esta ajuda
 
 Exit codes: 0 sucesso · 2 uso inválido · 1 falha de execução
@@ -240,7 +245,8 @@ parse_args() {
             --service-name)    SERVICE_NAME="${2:-}"; shift ;;
             --service-user)    SERVICE_USER="${2:-}"; shift ;;
             --recreate-db)     RECREATE_DB="true" ;;
-            --update)          die "A opção --update ainda não está implementada (NFR-005). Use o fluxo manual documentado no README." ;;
+            --regenerate-cert) REGENERATE_CERT="true" ;;
+            --update)          UPDATE="true" ;;
             --help|-h)         usage; exit 0 ;;
             *)                 usage; die "Opção desconhecida: $1" ;;
         esac
@@ -275,9 +281,27 @@ validate_inputs() {  # validação TOTAL antes da primeira mutação (FR-015/R12
     fi
 
     # FR-015: no modo não interativo, senha deve ser fornecida ou marcada como gerada
-    if [ "$NON_INTERACTIVE" = "true" ]; then
+    # (--update não mexe em credenciais: a vigente vive no .env)
+    if [ "$NON_INTERACTIVE" = "true" ] && [ "$UPDATE" != "true" ]; then
         if [ "$GENERATE_DB_PASSWORD" != "true" ] && [ -z "$DB_PASSWORD" ]; then
             die "Modo não interativo exige --db-password ou --generate-db-password."
+        fi
+    fi
+
+    # 061/CS-5: combinações que não se aplicam à atualização (a senha vigente
+    # vive no .env; a atualização NUNCA apaga dados nem regera certificado)
+    if [ "$UPDATE" = "true" ]; then
+        if [ "$RECREATE_DB" = "true" ]; then
+            die "Combinação inválida: --recreate-db é proibida com --update (a atualização nunca apaga dados)."
+        fi
+        if [ -n "$DB_PASSWORD" ]; then
+            die "Combinação inválida: --db-password não se aplica a --update (a senha vigente vive no .env)."
+        fi
+        if [ "$GENERATE_DB_PASSWORD" = "true" ]; then
+            die "Combinação inválida: --generate-db-password não se aplica a --update (a senha vigente vive no .env)."
+        fi
+        if [ "$REGENERATE_CERT" = "true" ]; then
+            die "Combinação inválida: --regenerate-cert não se aplica a --update (o certificado TLS existente é reutilizado)."
         fi
     fi
 
@@ -734,6 +758,68 @@ ensure_venv() {
 }
 
 # ----------------------------------------------------------------------------
+# T016-HTTPS — certificados TLS nativos (feature 061; baseline 056; contrato C2)
+# Reutiliza o mecanismo existente (scripts/gera_cert_dev.py — feature 056):
+# CA local + certificado com SAN (IP da LAN, localhost, hostname). Idempotente:
+# certificados existentes são REUTILIZADOS; --regenerate-cert regera (a CA nova
+# exige reimportar data/ssl/ca.crt nos aparelhos). Chave privada vive em
+# data/ssl (fora do versionamento — .gitignore do PRO) e NUNCA é publicada.
+# ----------------------------------------------------------------------------
+ensure_certificates() {
+    STEP="Certificados TLS (HTTPS nativo)"
+    local ssl_dir="$INSTALL_DIR/data/ssl"
+    local crt="$ssl_dir/server.crt" key="$ssl_dir/server.key"
+    local generator="$INSTALL_DIR/scripts/gera_cert_dev.py"
+    if [ -f "$crt" ] && [ -f "$key" ] && [ "$REGENERATE_CERT" != "true" ]; then
+        ok "Certificados TLS existentes — reutilizados (use --regenerate-cert para regerar)."
+        return
+    fi
+    if [ ! -f "$generator" ]; then
+        die "Gerador de certificados não encontrado: $generator — o snapshot do PRO deve conter scripts/gera_cert_dev.py."
+    fi
+    if ! command -v openssl >/dev/null 2>&1; then
+        die "openssl não encontrado no PATH — instale (ex.: apt-get install openssl) e reexecute (idempotente)."
+    fi
+    local force_flag=""
+    if [ "$REGENERATE_CERT" = "true" ]; then
+        warn "--regenerate-cert: a CA será REGERADA — será preciso reimportar data/ssl/ca.crt nos aparelhos."
+        force_flag="--force"
+    fi
+    info "Gerando CA local + certificado do servidor (SAN: IP da LAN, localhost, hostname)..."
+    ( cd "$INSTALL_DIR" && "$INSTALL_DIR/.venv/bin/python" scripts/gera_cert_dev.py $force_flag ) >&2
+    if [ ! -f "$crt" ] || [ ! -f "$key" ]; then
+        die "Certificados não encontrados após a geração (data/ssl/server.crt / server.key)."
+    fi
+    ok "Certificados TLS prontos em data/ssl (server.crt/server.key + ca.crt para os clientes)."
+}
+
+# ----------------------------------------------------------------------------
+# Firewall — decisão da 061 (clarify Q5): abrir automaticamente a porta da
+# aplicação (regra idempotente). Best-effort: sem ufw (ou inativo), apenas
+# orienta — não falha a instalação (o operador pode usar outro firewall).
+# ----------------------------------------------------------------------------
+ensure_firewall() {
+    STEP="Firewall (porta da aplicação)"
+    if ! command -v ufw >/dev/null 2>&1; then
+        warn "ufw não encontrado — abra manualmente a porta $APP_PORT/tcp no firewall em uso."
+        return
+    fi
+    if ! ufw status 2>/dev/null | grep -q "Status: active"; then
+        warn "ufw presente porém INATIVO — nada a abrir. Se ativar depois, permita: ufw allow $APP_PORT/tcp."
+        return
+    fi
+    if ufw status 2>/dev/null | grep -qE "(^|[[:space:]])$APP_PORT/tcp"; then
+        ok "Regra de firewall já existente para $APP_PORT/tcp — reutilizada (idempotente)."
+        return
+    fi
+    if ufw allow "$APP_PORT/tcp" >/dev/null 2>&1; then
+        ok "Regra de firewall criada: ufw allow $APP_PORT/tcp."
+    else
+        warn "Falha ao criar a regra no ufw — abra manualmente a porta $APP_PORT/tcp."
+    fi
+}
+
+# ----------------------------------------------------------------------------
 # T007 (parte final) — teste de conexão REAL via engine do projeto (FR-007)
 # ----------------------------------------------------------------------------
 test_db_connection() {
@@ -793,6 +879,11 @@ ensure_env_file() {
                         grep -q '^DATABASE_URL=' "$env_file" || echo "DATABASE_URL=$DATABASE_URL_BUILT" | $SUDO tee -a "$env_file" >/dev/null
                         grep -q '^APP_HOST='     "$env_file" || echo "APP_HOST=$APP_HOST" | $SUDO tee -a "$env_file" >/dev/null
                         grep -q '^APP_PORT='     "$env_file" || echo "APP_PORT=$APP_PORT" | $SUDO tee -a "$env_file" >/dev/null
+                        # HTTPS (061): ausente OU vazia é tratada como ausente — sem
+                        # passo manual pós-instalação (SC-003)
+                        grep -q '^APP_SSL_CERTFILE=.'   "$env_file" || echo "APP_SSL_CERTFILE=data/ssl/server.crt" | $SUDO tee -a "$env_file" >/dev/null
+                        grep -q '^APP_SSL_KEYFILE=.'    "$env_file" || echo "APP_SSL_KEYFILE=data/ssl/server.key"  | $SUDO tee -a "$env_file" >/dev/null
+                        grep -q '^AUTH_COOKIE_SECURE=.' "$env_file" || echo "AUTH_COOKIE_SECURE=true" | $SUDO tee -a "$env_file" >/dev/null
                         ok "Chaves ausentes adicionadas ao .env existente."
                         ;;
                     *) warn ".env mantido sem alterações (valores existentes preservados)." ;;
@@ -807,13 +898,20 @@ ensure_env_file() {
 
     umask 077  # arquivo nasce 0600 (SR-002)
     cat > "$env_file" <<ENVEOF
-# Gerado por install.sh (feature 027) em $(date '+%Y-%m-%d %H:%M:%S %Z')
+# Gerado por install.sh (features 027/061) em $(date '+%Y-%m-%d %H:%M:%S %Z')
 # Conexão com o banco MariaDB/MySQL (obrigatória — a aplicação não inicia sem ela)
 DATABASE_URL=$DATABASE_URL_BUILT
 
 # Bind da aplicação
 APP_HOST=$APP_HOST
 APP_PORT=$APP_PORT
+
+# HTTPS nativo (features 056/061 — TLS no próprio servidor; contrato C2 da 061)
+APP_SSL_CERTFILE=data/ssl/server.crt
+APP_SSL_KEYFILE=data/ssl/server.key
+
+# Cookie de sessão enviado SOMENTE por HTTPS (obrigatório com HTTPS ativo)
+AUTH_COOKIE_SECURE=true
 ENVEOF
 
     if ! command -v mysqldump >/dev/null 2>&1; then
@@ -963,7 +1061,7 @@ start_and_health_check() {
     info "Aguardando /health (até ${HEALTH_TIMEOUT_SECONDS}s)..."
     local waited=0 result status
     while [ "$waited" -lt "$HEALTH_TIMEOUT_SECONDS" ]; do
-        if result="$(curl -fsS "http://127.0.0.1:$APP_PORT/health" 2>/dev/null)"; then
+        if result="$(curl -kfsS "https://127.0.0.1:$APP_PORT/health" 2>/dev/null)"; then
             status="$(printf '%s' "$result" | python3 -c 'import sys, json; print(json.load(sys.stdin).get("status", ""))' 2>/dev/null || true)"
             case "$status" in
                 healthy)
@@ -1066,10 +1164,10 @@ PYEOF
         failures=$((failures + 1))
     fi
 
-    if curl -fsS "http://127.0.0.1:$APP_PORT/health" >/dev/null 2>&1; then
-        ok "HTTP /health: OK"
+    if curl -kfsS "https://127.0.0.1:$APP_PORT/health" >/dev/null 2>&1; then
+        ok "HTTPS /health: OK"
     else
-        err "HTTP /health: FALHOU"
+        err "HTTPS /health: FALHOU"
         failures=$((failures + 1))
     fi
 
@@ -1088,9 +1186,10 @@ print_summary() {
     echo "${C_BOLD}  ══════════════════════════════════════════════════════════════${C_RESET}" >&2
     echo >&2
     echo "${C_BOLD}  ACESSO${C_RESET}" >&2
-    _kv "Aplicação   " "http://${ip_addr:-$APP_HOST}:$APP_PORT"
-    _kv "Swagger API " "http://${ip_addr:-$APP_HOST}:$APP_PORT/docs"
-    _kv "Health check" "http://${ip_addr:-$APP_HOST}:$APP_PORT/health"
+    _kv "Aplicação   " "https://${ip_addr:-$APP_HOST}:$APP_PORT"
+    _kv "Swagger API " "https://${ip_addr:-$APP_HOST}:$APP_PORT/docs"
+    _kv "Health check" "https://${ip_addr:-$APP_HOST}:$APP_PORT/health"
+    _kv "CA clientes " "$INSTALL_DIR/data/ssl/ca.crt (importe nos aparelhos — 1x)"
     echo >&2
     echo "${C_BOLD}  INSTALAÇÃO${C_RESET}" >&2
     _kv "Diretório   " "$INSTALL_DIR"
@@ -1149,10 +1248,139 @@ security_self_check() {
 }
 
 # ----------------------------------------------------------------------------
+# 061/CS-5 — atualização de instalação existente (--update): código + dependências
+# + schema + reinício. .env e dados NUNCA tocados; árvore suja ABORTA (o
+# instalador nunca reverte código); pull é --ff-only (nunca merge/force).
+# ----------------------------------------------------------------------------
+read_env_value() {  # $1=arquivo $2=chave $3=default → valor do .env (fonte de verdade da instalação)
+    local file="$1" key="$2" def="${3:-}" line
+    if [ ! -f "$file" ]; then
+        printf '%s' "$def"
+        return 0
+    fi
+    line="$(grep -E "^${key}=" "$file" 2>/dev/null | head -n1 | cut -d= -f2- | tr -d '\042\047' | tr -d '[:space:]')"
+    printf '%s' "${line:-$def}"
+}
+
+update_check_existing() {
+    STEP="Verificação da instalação existente"
+    local miss=""
+    [ -d "$INSTALL_DIR/.git" ]             || miss="$miss .git(clone)"
+    [ -x "$INSTALL_DIR/.venv/bin/python" ] || miss="$miss .venv/bin/python"
+    [ -f "$INSTALL_DIR/.env" ]             || miss="$miss .env"
+    [ -f "$INSTALL_DIR/run.py" ]           || miss="$miss run.py"
+    if [ -n "$miss" ]; then
+        die "Atualização exige uma instalação existente em $INSTALL_DIR (ausente:${miss}). Para primeira instalação, execute sem --update; para reparo, reexecute o instalador completo."
+    fi
+    # O .env é a fonte de verdade da instalação: porta real para o health check.
+    APP_PORT="$(read_env_value "$INSTALL_DIR/.env" "APP_PORT" "$APP_PORT")"
+    # Serviço do banco (a bateria pós-atualização referencia o nome) — mesma
+    # detecção do detect_host, sem instalar nada
+    for svc in mariadb mysql; do
+        if systemctl is-active --quiet "$svc.service" 2>/dev/null; then
+            BANCO_SERVICE_DETECTED="$svc.service"
+            break
+        fi
+    done
+    if [ -z "$BANCO_SERVICE_DETECTED" ] && command -v mariadbd >/dev/null 2>&1; then
+        BANCO_SERVICE_DETECTED="mariadb.service"
+    fi
+    if [ -z "$BANCO_SERVICE_DETECTED" ] && command -v mysqld >/dev/null 2>&1; then
+        BANCO_SERVICE_DETECTED="mysql.service"
+    fi
+    detect_db_client
+    ok "Instalação existente válida em $INSTALL_DIR — .env e dados PRESERVADOS (porta da app: $APP_PORT)."
+}
+
+update_repo() {
+    STEP="Código-fonte (fetch + pull --ff-only)"
+    local dirty local_head remote_head
+    dirty="$(git -C "$INSTALL_DIR" status --porcelain || true)"
+    if [ -n "$dirty" ]; then
+        err "A árvore do clone possui alterações locais (git status não vazio)."
+        die "Atualização abortada: o instalador NUNCA reverte código — resolva as alterações locais (commit/stash) manualmente e reexecute --update."
+    fi
+    if ! git -C "$INSTALL_DIR" fetch origin "$BRANCH" >&2; then
+        die "git fetch falhou (rede/repositório) — nenhuma alteração aplicada; reexecute --update mais tarde."
+    fi
+    remote_head="$(git -C "$INSTALL_DIR" rev-parse --short "origin/$BRANCH" 2>/dev/null || true)"
+    if [ -z "$remote_head" ]; then
+        die "Branch remota 'origin/$BRANCH' não encontrada após o fetch."
+    fi
+    local_head="$(git -C "$INSTALL_DIR" rev-parse --short HEAD)"
+    if [ "$local_head" = "$remote_head" ]; then
+        ok "Código já atualizado (HEAD = origin/$BRANCH) — nada a aplicar."
+        return 0
+    fi
+    if ! git -C "$INSTALL_DIR" pull --ff-only origin "$BRANCH" >&2; then
+        die "pull --ff-only falhou (histórico divergido) — nenhuma alteração aplicada. Resolva a divergência manualmente e reexecute --update."
+    fi
+    ok "Código atualizado: $local_head -> $(git -C "$INSTALL_DIR" rev-parse --short HEAD)."
+}
+
+update_venv_deps() {
+    STEP="Dependências (pip install -r)"
+    info "Sincronizando dependências (pip install -r requirements.txt; idempotente — leva alguns minutos quando houver novidades)..."
+    # Saída VISÍVEL (sem >/dev/null): mesmo racional do ensure_venv (progresso
+    # silencioso parece travamento e convida a uma 2ª execução concorrente)
+    $SUDO "$INSTALL_DIR/.venv/bin/python" -m pip install --progress-bar off -r "$INSTALL_DIR/requirements.txt" >&2
+    ( cd "$INSTALL_DIR" && ./.venv/bin/python -c 'import fastapi, sqlalchemy, pymysql, ldap3, reportlab, openpyxl, dotenv' )
+    ok "Dependências sincronizadas (imports OK)."
+}
+
+print_update_summary() {
+    local ip_addr
+    ip_addr="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    echo >&2
+    echo "${C_BOLD}  ══════════════════════════════════════════════════════════════${C_RESET}" >&2
+    ok "SisPatrimônio Pro atualizado com sucesso!"
+    echo "${C_BOLD}  ══════════════════════════════════════════════════════════════${C_RESET}" >&2
+    echo >&2
+    _kv "Aplicação   " "https://${ip_addr:-$APP_HOST}:$APP_PORT"
+    _kv "Health check" "https://${ip_addr:-$APP_HOST}:$APP_PORT/health"
+    _kv "Diretório   " "$INSTALL_DIR"
+    _kv "Serviço     " "$SERVICE_NAME (reiniciado ao final da atualização)"
+    _kv "Configuração" "$INSTALL_DIR/.env (PRESERVADO — nenhuma chave alterada)"
+    echo >&2
+}
+
+update_main() {  # fluxo próprio (não passa por coleta de segredos/confirmação de plano)
+    setup_logging
+    echo >&2
+    echo "==============================================================" >&2
+    info "SisPatrimônio Pro — ATUALIZAÇÃO Linux v${APP_VERSION_INSTALLER} ($(date '+%Y-%m-%d %H:%M:%S'))"
+    echo "==============================================================" >&2
+    echo >&2
+
+    STEP="Parâmetros e validação"
+    validate_inputs
+    require_root
+    check_connectivity
+    TOTAL_STEPS=8
+    run_step "Verificação da instalação existente"   update_check_existing
+    run_step "Código-fonte (fetch + pull --ff-only)" update_repo
+    run_step "Dependências (pip install -r)"         update_venv_deps
+    run_step "Usuário e permissões do serviço"       ensure_service_user
+    run_step "Parada do serviço de rodada anterior"  stop_service_if_running
+    run_step "Atualização do schema (init_db)"       init_database
+    run_step "Start + health check"                  start_and_health_check
+    run_step "Bateria pós-atualização"               post_install_checks
+
+    print_update_summary
+    ok "Atualização concluída."
+}
+
+# ----------------------------------------------------------------------------
 # main
 # ----------------------------------------------------------------------------
 main() {
     parse_args "$@"
+    # 061/CS-5: a atualização tem fluxo próprio (nunca coleta segredos nem
+    # toca .env/dados; reutiliza banco, venv, cert e serviço existentes)
+    if [ "$UPDATE" = "true" ]; then
+        update_main
+        return 0
+    fi
     setup_logging
     echo >&2
     echo "==============================================================" >&2
@@ -1178,6 +1406,7 @@ main() {
     run_step "Pacotes do sistema (Python, Git, MariaDB)"  ensure_packages
     run_step "Código-fonte (clone)"                       ensure_repo
     run_step "Ambiente virtual e dependências"            ensure_venv
+    run_step "Certificados TLS (HTTPS nativo)"            ensure_certificates
     run_step "Montagem da URL do banco"                   build_database_url
     run_step "Banco de dados (criação/validação)"         ensure_database
     run_step "Arquivo de configuração .env"               ensure_env_file
@@ -1190,6 +1419,7 @@ main() {
     run_step "Start + health check"                       start_and_health_check
     run_step "Bateria pós-instalação"                     post_install_checks
     run_step "Auditoria de segurança"                     security_self_check
+    run_step "Firewall (porta da aplicação)"              ensure_firewall
 
     print_summary
     ok "Concluído."

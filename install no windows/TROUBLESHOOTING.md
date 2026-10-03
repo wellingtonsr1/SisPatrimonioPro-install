@@ -345,3 +345,20 @@ Write-Host "Diagnostico em: $d"
 ```
 
 > O log do instalador e o `env-sem-credenciais.txt` não contêm senhas (o instalador audita o log ao final — SR-001). Os arquivos de `data\logs` são da aplicação; revise antes de enviar externamente.
+
+## HTTPS (nativa — features 056/061)
+
+### T15. O instalador falhou na etapa "Certificados TLS (HTTPS nativo)"
+
+- **openssl não encontrado**: o Git for Windows traz `openssl.exe` em `C:\Program Files\Git\usr\bin\`. Reinstale o Git (o instalador o instala via winget) ou adicione ao PATH e reexecute (idempotente).
+- **"Gerador de certificados não encontrado"**: o clone do PRO não contém `scripts/gera_cert_dev.py` — verifique o snapshot publicado no SisPatrimonioPro (o deploy deve incluir `scripts/`).
+- **Falha na geração**: leia a mensagem do gerador (IP loopback/link-local → informe o IP real; regere com `-RegenerateCert`).
+
+### T16. A página abre em `https://` mas o aparelho não confia no certificado
+
+- Importe `data\ssl\ca.crt` como CA confiável no aparelho (uma vez por dispositivo). Sem isso o navegador mostra aviso de cadeia — comportamento esperado para CA própria.
+- Se o **IP da LAN mudou**, o SAN não bate mais: regenere com `-RegenerateCert` (reimportar a nova `ca.crt`) e acesse pelo novo IP.
+
+### T17. O login para de funcionar após ativar o HTTPS
+
+- `AUTH_COOKIE_SECURE=true` exige acesso **exclusivamente** via `https://`. Acesse `https://<ip>:8000` (não `http://`). O instalador grava essa chave junto com o TLS — não remova uma sem a outra.
