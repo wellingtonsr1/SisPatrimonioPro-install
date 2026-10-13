@@ -33,6 +33,7 @@ Os scripts são **idempotentes**: na imensa maioria dos casos, corrija a causa e
 | Ambiente corporativo com proxy / sem internet | [T17](#t17-proxy-ou-rede-restrita) |
 | "Falha ao montar DATABASE_URL (percent-encoding via Python)" com SyntaxError | [T18](#t18-falha-ao-montar-database_url-percent-encoding-via-python) |
 | Servidor MySQL 8 existente / "cryptography is required for sha256_password" | [T19](#t19-servidor-mysql-8-existente-serviço-mysql80--cryptography-is-required) |
+| Como atualizar quando o repositório ganha uma versão nova | [Atualização](#atualização-de-uma-instalação-existente) |
 
 ---
 
@@ -386,6 +387,68 @@ Write-Host "Diagnostico em: $d"
 ```
 
 > O log do instalador e o `env-sem-credenciais.txt` não contêm senhas (o instalador audita o log ao final — SR-001). Os arquivos de `data\logs` são da aplicação; revise antes de enviar externamente.
+
+---
+
+## Atualização de uma instalação existente
+
+Quando sai uma versão nova no repositório `SisPatrimonioPro` (GitHub), a
+atualização é um fluxo manual de 4 passos: o instalador **não faz `git pull`**
+(ele reaproveita o clone existente, apenas o re-clona se o diretório estiver
+vazio) e a opção `-Update` está reservada (NFR-005). Tudo abaixo é
+idempotente e **nenhum dado é apagado**.
+
+**1. Preserve alterações locais do clone** (fixes pendentes, experimentos):
+
+```powershell
+git -C C:\SisPatrimonioPro status            # vazio? prossiga; ' M ...'? commite/stashe
+git -C C:\SisPatrimonioPro stash             # ou commite antes de prosseguir
+```
+
+Um `git pull` se recusa (ou mistura) se o upstream tocou arquivos modificados
+localmente — resolver isso ANTES de puxar.
+
+**2. Atualize o código:**
+
+```powershell
+git -C C:\SisPatrimonioPro pull
+```
+
+**3. Atualize as dependências** — o instalador só roda `pip install -r
+requirements.txt` na CRIAÇÃO do venv; com o venv já existente, dependências
+novas não entram sozinhas:
+
+```powershell
+C:\SisPatrimonioPro\.venv\Scripts\python.exe -m pip install -r C:\SisPatrimonioPro\requirements.txt
+```
+
+**4. Reexecute o instalador** (PowerShell elevado):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File "install no windows\nativa\install.ps1"
+```
+
+O que ele cuida na reexecução:
+
+- `.env` **nunca é sobrescrito** — só completa chaves ausentes (responda `S`)
+  e sincroniza o `DATABASE_URL` se você aceitar;
+- schema do banco via `init_db()` (create_all + migrações leves);
+- tarefa agendada re-registrada somente se a definição mudou;
+- certificados SSL revalidados (validade ≥ 14 dias e SAN cobrindo o IP atual)
+  e reutilizados; `APP_SSL_CERTFILE`/`APP_SSL_KEYFILE` regravadas no `.env`
+  quando necessário (sem TLS: `-SkipSsl`);
+- health check e bateria final garantem o estado saudável antes de concluir.
+
+**Confirmação:** o resumo final mostra as URLs com o esquema correto
+(`https://` com TLS ativo) e a linha `Bateria completa: todas as verificacoes
+passaram.`
+
+> Atenção: o `git pull` NÃO mexe em MySQL nem em dados (eles vivem no banco,
+> nunca no repositório). Se a nova versão removeu arquivos do clone, o pull
+>some com eles localmente — backups da aplicação ("Backup manual") são a via
+> de segurança antes de qualquer atualização grande.
+
+---
 
 ## HTTPS (nativa — features 056/061)
 
