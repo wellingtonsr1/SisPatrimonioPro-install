@@ -592,6 +592,11 @@ function Ensure-Database {
     }
 
     # Grants: SOMENTE no banco da aplicacao (SR-003) - idempotente
+    # NOTA (backup manual no MySQL 8+/GTID): o --single-transaction so emite
+    # FLUSH TABLES (que exigiria RELOAD/FLUSH_TABLES global) no caminho de
+    # GTID_PURGED - por isso o app usa --set-gtid-purged=OFF no dump (provado
+    # em campo: dump completo com exit 0 E SEM privilegios globais). NAO grant
+    # FLUSH_TABLES aqui: privilegio global redundante violaria o SR-003.
     [void](Invoke-DbSql -Sql "GRANT ALL PRIVILEGES ON ``$DbName``.* TO '$DbUser'@'localhost';" -Password $DbAdminPassword)
     [void](Invoke-DbSql -Sql "GRANT ALL PRIVILEGES ON ``$DbName``.* TO '$DbUser'@'127.0.0.1';" -Password $DbAdminPassword)
     [void](Invoke-DbSql -Sql 'FLUSH PRIVILEGES;' -Password $DbAdminPassword)
