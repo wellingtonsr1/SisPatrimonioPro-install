@@ -3,18 +3,11 @@
     SisPatrimonio Pro - Instalador Automatizado de Producao WINDOWS (nativo)
 
 .DESCRIPTION
-    Versao Windows (PowerShell) do install.sh (Features 027/061). Prepara um
-    servidor Windows para executar o SisPatrimonio Pro em producao:
-      prerequisitos -> Python >= 3.10 -> Git -> MySQL Server nativo -> banco+usuario
-      -> clone -> venv -> requirements.txt -> certificados TLS -> .env
-      -> Tarefa Agendada (servico) -> /health (HTTPS) -> resumo
-
-    Feature 061: banco NATIVO = MySQL Server (Oracle; via winget 'Oracle.MySQL').
-    Servicos MariaDB/MySQL existentes sao REUTILIZADOS; servico apontando para
-    binario do XAMPP NUNCA e reutilizado (FR-013). A faixa de versoes suportada
-    (MySQL >= 8.0, MariaDB >= 10.5) e validada contra o SERVIDOR REAL. -Update:
-    atualiza a instalacao existente (codigo + dependencias + schema + reinicio)
-    sem tocar .env/dados; arvore suja ABORTA (nunca reverte codigo).
+    Versao Windows (PowerShell) do install.sh (Feature 027). Prepara um servidor
+    Windows para executar o SisPatrimonio Pro em producao:
+      prerequisitos -> Python >= 3.10 -> Git -> MariaDB/MySQL -> banco+usuario
+      -> clone -> venv -> requirements.txt -> certificados SSL (HTTPS local)
+      -> .env -> Tarefa Agendada (servico) -> /health -> resumo
 
     Idempotente: pode ser executado novamente - cada etapa detecta o estado
     anterior e REUTILIZA o que ja existe. Banco existente NUNCA e apagado
@@ -35,9 +28,6 @@
         de ambiente SISPAT_DB_ADMIN_PASSWORD no modo nao interativo).
       - regra de firewall de entrada e criada para a porta da aplicacao
         (sem ela o acesso via rede e bloqueado por padrao no Windows).
-      - HTTPS nativo (features 056/061): certificados gerados em data\ssl
-        (scripts/gera_cert_dev.py) e APP_SSL_CERTFILE/APP_SSL_KEYFILE +
-        AUTH_COOKIE_SECURE=true gravados no .env; health/resumo em https://.
 
 .USO
     powershell -ExecutionPolicy Bypass -File install.ps1
@@ -70,7 +60,7 @@ param(
     [string]$ServiceName,
     [string]$ServiceUser,
     [switch]$RecreateDb,
-    [switch]$RegenerateCert,
+    [switch]$SkipSsl,
     [switch]$Update,
     [switch]$Help
 )
@@ -88,8 +78,8 @@ $ProgressPreference    = 'SilentlyContinue'
 $DefaultRepoUrl     = 'https://github.com/wellingtonsr1/SisPatrimonioPro.git'
 $DefaultBranch      = 'main'
 $DefaultInstallDir  = 'C:\SisPatrimonioPro'
-$DefaultDbName      = 'sispatrimoniopro'
-$DefaultDbUser      = 'patrimonio'
+$DefaultDbName      = 'sispatrimoniopro_db'
+$DefaultDbUser      = 'sispat'
 $DefaultDbHost      = '127.0.0.1'   # TCP local ('localhost' pode resolver em socket/pipe no Windows)
 $DefaultDbPort      = '3306'
 $DefaultAppHost     = '0.0.0.0'
@@ -101,10 +91,11 @@ $HealthTimeoutSeconds = 120
 $MinPythonMajor = 3
 $MinPythonMinor = 10
 
-$AppVersionInstaller = '1.1.0-win'
+$AppVersionInstaller = '1.2.0-win'
 $Script:Step   = ''
 $Script:StepNo = 0
 $TotalSteps    = 16
+$script:SslEnabled = $false   # decidido na etapa 'Certificados SSL (HTTPS local)'
 
 # ----------------------------------------------------------------------------
 # Log (FR-016, R1/R2): niveis INFO/OK/WARNING/ERROR + arquivo em ProgramData.
@@ -148,10 +139,10 @@ function Test-Confirmed([string]$Question) {
     return ($ans -match '^(s|S|sim|SIM|y|Y)$')
 }
 
-# Coleta de senha SEM ECO (SR-001). Vazio NAS DUAS entradas = gerar automaticamente.
+# Coleta de senha SEM ECO (SR-001). Vazio NAS DUAS entradas = tentar senha vazia.
 function Read-Secret([string]$Prompt) {
     $p1 = Read-Host -AsSecureString $Prompt
-    $p2 = Read-Host -AsSecureString 'Confirme a senha (vazio nas duas = gerar automaticamente):'
+    $p2 = Read-Host -AsSecureString 'Confirme a senha (vazio nas duas = tentar senha vazia)'
     if ($p1.Length -eq 0 -and $p2.Length -eq 0) { return '' }
     $b1 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($p1)
     $b2 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($p2)
@@ -205,10 +196,8 @@ Uso: powershell -ExecutionPolicy Bypass -File install.ps1 [opcoes]
   -ServiceUser <usuario>       Usuario da tarefa (default: SYSTEM)
   -RecreateDb                  APAGA e recria o banco da aplicacao (SO interativo;
                                dupla confirmacao; proibido com -NonInteractive)
-  -RegenerateCert              Regenera CA+certificado TLS (reimportar ca.crt nos clientes)
-  -Update                      Atualiza a instalacao existente (git fetch +
-                               pull --ff-only, pip, init_db, reinicio, health);
-                               .env e dados preservados (nunca reverte codigo)
+  -SkipSsl                     Nao gera certificados SSL nem grava APP_SSL_* (HTTP puro)
+  -Update                      Reservado: ainda nao implementado (NFR-005)
   -Help                        Esta ajuda
 
 Nota de seguranca: em modo NAO interativo a senha de root do MariaDB deve
@@ -220,12 +209,7 @@ Exit codes: 0 sucesso | 2 uso invalido | 1 falha de execucao
 
 function Parse-Args {
     if ($Help) { Show-Usage; exit 0 }
-    if ($Update) {
-        if ($RecreateDb)         { die 'Combinacao invalida: -RecreateDb e proibida com -Update (a atualizacao NUNCA apaga dados).' }
-        if ($GenerateDbPassword) { die 'Combinacao invalida: -GenerateDbPassword nao se aplica a -Update (a senha vigente vive no .env).' }
-        if ($DbPassword)         { die 'Combinacao invalida: -DbPassword nao se aplica a -Update (a senha vigente vive no .env).' }
-        if ($RegenerateCert)     { die 'Combinacao invalida: -RegenerateCert nao se aplica a -Update (o certificado TLS existente e reutilizado).' }
-    }
+    if ($Update) { die 'A opcao -Update ainda nao esta implementada (NFR-005). Use o fluxo manual documentado no README.' }
     if ($Repo)   { $script:RepoUrl = $Repo }
     if ($Branch) { $script:BranchValue = $Branch }
 }
@@ -266,8 +250,7 @@ function Validate-Inputs {
         die 'Combinacao invalida: -RecreateDb e proibida com -NonInteractive (decisao D2).'
     }
     # FR-015: no modo nao interativo, senha deve ser fornecida ou marcada como gerada
-    # (-Update nao mexe em credenciais: a vigente vive no .env)
-    if ($NonInteractive -and -not $GenerateDbPassword -and -not $DbPassword -and -not $Update) {
+    if ($NonInteractive -and -not $GenerateDbPassword -and -not $DbPassword) {
         die 'Modo nao interativo exige -DbPassword ou -GenerateDbPassword.'
     }
     if ($DbPassword -and $GenerateDbPassword) {
@@ -295,7 +278,7 @@ function Collect-Secrets {
     }
     if (-not $DbPassword) {
         Write-Host ''
-        $script:DbPassword = Read-Secret 'Senha do banco (min. 12 caracteres; ENTER vazio nas duas = gerar automaticamente): '
+        $script:DbPassword = Read-Secret 'Senha do banco (min. 12 caracteres; ENTER vazio nas duas = gerar automaticamente)'
         if (-not $DbPassword) {
             $script:DbPassword = New-Secret
             ok 'Senha do banco gerada automaticamente (gravada apenas no .env).'
@@ -340,7 +323,7 @@ function Require-Admin {
 # T005 - Deteccao de host (data-model S1.2, R3/R4)
 # ----------------------------------------------------------------------------
 function Get-PythonVersion {
-    try { return (& python -c "import sys; print('%d.%d' % (sys.version_info[0], sys.version_info[1]))" 2>$null) } catch { return '0.0' }
+    try { return (Invoke-PyCode -PythonExe 'python' "import sys; print('%d.%d' % (sys.version_info[0], sys.version_info[1]))" 2>$null) } catch { return '0.0' }
 }
 
 function Test-PythonAtLeast([int]$Major, [int]$Minor) {
@@ -373,22 +356,11 @@ function Detect-Host {
     }
     if (Get-Command git -ErrorAction SilentlyContinue) { ok 'Git detectado.' } else { warn 'Git nao encontrado.' }
 
-    # D3/R4 + 061/FR-013: detecta MariaDB OU MySQL por servico real; servico
-    # apontando para binario do XAMPP NUNCA e reutilizado (banco nativo = MySQL).
+    # D3/R4: detecta MariaDB OU MySQL por servico real
     $script:DbServiceName = ''
     $svc = Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(MariaDB|MySQL)' -or $_.DisplayName -match '^(MariaDB|MySQL)' } | Select-Object -First 1
-    if ($svc) {
-        $bin = (Get-CimInstance Win32_Service -Filter "Name='$($svc.Name)'" -ErrorAction SilentlyContinue).PathName
-        if ($bin -match 'xampp') {
-            warn ("Servico de banco '" + $svc.Name + "' aponta para binario do XAMPP - NAO sera reutilizado (XAMPP nao e suportado como banco do sistema - FR-013).")
-            warn 'Sera instalado MySQL Server NATIVO. Migrar os dados e desativar o servico do XAMPP e decisao do operador.'
-        } else {
-            $script:DbServiceName = $svc.Name
-            ok ("Servidor de banco detectado: servico '" + $svc.Name + "' (sera REUTILIZADO).")
-        }
-    } else {
-        warn 'Nenhum servidor MySQL/MariaDB nativo detectado (sera instalado MySQL Server - feature 061).'
-    }
+    if ($svc) { $script:DbServiceName = $svc.Name; ok ("Servidor de banco detectado: servico '" + $svc.Name + "' (sera REUTILIZADO).") }
+    else      { warn 'Nenhum servidor MariaDB/MySQL detectado (sera instalado MariaDB - decisao D3).' }
 
     $script:DbClient = Find-DbClientExe
     if ($DbClient) { ok ('Cliente de banco: ' + $DbClient) }
@@ -434,18 +406,11 @@ function Ensure-Packages {
     ok 'Git disponivel.'
 
     if (-not $DbServiceName) {
-        # 061/US3 (FR-013): banco nativo = MySQL Server (Oracle). O pacote
-        # winget instala o "MySQL Installer"; se ele ainda nao criar o servico
-        # do servidor, o operador configura o MySQL Server pelo proprio MySQL
-        # Installer e reexecuta (idempotente - nada e duplicado).
-        if (-not (Install-WinGetPackage 'Oracle.MySQL' 'MySQL Server (nativo)')) {
-            die 'MySQL Server nao instalado via winget. Instale o MySQL Server 8.0+ manualmente (dev.mysql.com/downloads/installer; servico automatico, porta 3306) e reexecute - o instalador e idempotente.'
+        if (-not (Install-WinGetPackage 'MariaDB.Server' 'MariaDB Server')) {
+            die 'MariaDB nao instalado. Instale o MariaDB manualmente (mariadb.org) e reexecute - o instalador e idempotente.'
         }
-        $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
         $svc = Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(MariaDB|MySQL)' } | Select-Object -First 1
-        if (-not $svc) {
-            die 'Servico do MySQL nao encontrado apos a instalacao do MySQL Installer. Abra o "MySQL Installer" do menu Iniciar, adicione/configure o MySQL Server 8.0+ (porta 3306, servico iniciado com o Windows, defina a senha de root) e reexecute (idempotente).'
-        }
+        if (-not $svc) { die 'Servico do MariaDB nao encontrado apos a instalacao. Verifique a instalacao manualmente e reexecute.' }
         $script:DbServiceName = $svc.Name
     }
     if ((Get-Service -Name $DbServiceName -ErrorAction SilentlyContinue).StartType -eq 'Disabled') {
@@ -472,13 +437,18 @@ function Ensure-Packages {
 function Invoke-DbSql {
     # Executa SQL com credencial no ambiente (senha nunca em argv/log).
     # Retorna as linhas de saida do cliente; para sucesso/falha use Test-DbSql
-    # (ou $LASTEXITCODE logo apos a chamada).
-    param([string]$Sql, [string]$AsUser = 'root', [string]$Password)
+    # (ou $LASTEXITCODE logo apos a chamada). Com -ShowError, em caso de falha
+    # a mensagem REAL do servidor e exibida (nunca contem a senha - SR-001).
+    param([string]$Sql, [string]$AsUser = 'root', [string]$Password, [switch]$ShowError)
     $old = $env:MYSQL_PWD
     try {
         $env:MYSQL_PWD = $Password
         $cliArgs = @('--user', $AsUser, '--host', $script:DbHost, '--port', $script:DbPort, '-N', '-B', '-e', $Sql)
         $out = & $script:DbClient @cliArgs 2>$null
+        if ($ShowError -and $LASTEXITCODE -ne 0) {
+            warn 'Erro retornado pelo servidor:'
+            & $script:DbClient @cliArgs 2>&1 | ForEach-Object { err ('  ' + $_.ToString().Trim()) }
+        }
         return ,@($out)
     } finally {
         if ($null -ne $old) { $env:MYSQL_PWD = $old } else { Remove-Item Env:\MYSQL_PWD -ErrorAction SilentlyContinue }
@@ -511,10 +481,22 @@ function Resolve-DbAdminAccess {
     if ($NonInteractive) {
         die 'Nao foi possivel autenticar como root do banco. Defina SISPAT_DB_ADMIN_PASSWORD no ambiente e reexecute.'
     }
-    warn 'Nao foi possivel autenticar como root com as credenciais automaticas.'
-    $p = Read-Secret 'Senha de root do MariaDB/MySQL (sem eco; vazia nas duas = tentar senha vazia): '
+    warn 'Nao foi possivel autenticar como root com as credenciais automaticas (SISPAT_DB_ADMIN_PASSWORD ou senha vazia).'
+    $p = Read-Secret 'Senha de root do MariaDB/MySQL (sem eco; vazia nas duas = tentar senha vazia)'
     if (-not $p) { $p = '' }
+    if ($p -eq '') { warn 'Nenhuma senha digitada - sera tentada a senha VAZIA do root (digite a senha para autenticar de verdade).' }
     if (-not (Test-DbSql -Sql 'SELECT 1;' -Password $p)) {
+        # Diagnostico: mostra o erro REAL do servidor (Access denied 1045,
+        # servidor parado 2003, etc.). A mensagem do MySQL NUNCA contem a
+        # senha (ela segue apenas por MYSQL_PWD - SR-001).
+        warn 'Erro retornado pelo servidor:'
+        $env:MYSQL_PWD = $p
+        try {
+            & $script:DbClient @('--user', 'root', '--host', $script:DbHost, '--port', $script:DbPort, '-N', '-B', '-e', 'SELECT 1;') 2>&1 |
+                ForEach-Object { err ('  ' + $_.ToString().Trim()) }
+        } finally {
+            Remove-Item Env:\MYSQL_PWD -ErrorAction SilentlyContinue
+        }
         die 'Credencial de root invalida. Verifique a senha do root e reexecute (idempotente).'
     }
     $script:DbAdminPassword = $p
@@ -548,55 +530,65 @@ function Confirm-RecreateDb {
 function Ensure-Database {
     Resolve-DbAdminAccess
 
-    $existsVal = (@(Invoke-DbSql -Sql "SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='$(Sql-Escape $DbName)';" -Password $DbAdminPassword) -join '').Trim()
-    if ($existsVal -eq $DbName -and -not $RecreateDb) {
-        ok "Banco '$DbName' ja existe - REUTILIZADO (nada sera apagado)."
-    } elseif ($existsVal -eq $DbName -and $RecreateDb) {
+    # Detecta a familia do servidor (MariaDB vs MySQL) e reconstruir a URL com o
+    # dialecto correto (caso real: MySQL Server 26.7 + 'mariadb+pymysql' falha
+    # com "MySQL version 26.7.0 is not a MariaDB variant").
+    # PS5.1: a saida de Invoke-DbSql e um WRAPPER de array que NAO achata via
+    # '@()' nem ForEach-Object (reproduzido: vira 'System.Object[]' e a
+    # deteccao falharia num MariaDB real). Out-String achata qualquer forma
+    # de saida; o replace remove o quebra-linha (versao nao tem espacos).
+    $srvVer = ((Invoke-DbSql -Sql 'SELECT VERSION();' -Password $DbAdminPassword | Out-String) -replace '\s', '').Trim()
+    if ($srvVer -match 'MariaDB') { $script:DbUrlScheme = 'mariadb+pymysql' } else { $script:DbUrlScheme = 'mysql+pymysql' }
+    Build-DatabaseUrl
+    $family = if ($srvVer -match 'MariaDB') { 'MariaDB' } else { 'MySQL' }
+    ok ("Familia do servidor: " + $family + " (versao " + $srvVer + ") - DATABASE_URL com esquema " + $script:DbUrlScheme + ".")
+
+    if ($RecreateDb) {
         warn "APAGANDO banco '$DbName' (solicitacao explicita -RecreateDb)..."
-        [void](Invoke-DbSql -Sql "DROP DATABASE ``$DbName``;" -Password $DbAdminPassword)
-        if ($LASTEXITCODE -ne 0) { die "Falha ao apagar o banco '$DbName' - verifique o acesso administrativo e reexecute." }
-        [void](Invoke-DbSql -Sql "CREATE DATABASE ``$DbName`` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" -Password $DbAdminPassword)
-        if ($LASTEXITCODE -ne 0) { die "Falha ao recriar o banco '$DbName' - verifique o acesso administrativo e reexecute." }
+        [void](Invoke-DbSql -Sql "DROP DATABASE ``$DbName``;" -Password $DbAdminPassword -ShowError)
+        if ($LASTEXITCODE -ne 0) { warn "DROP falhou (o banco pode nao existir) - seguindo para a criacao." }
+        [void](Invoke-DbSql -Sql "CREATE DATABASE ``$DbName`` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" -Password $DbAdminPassword -ShowError)
+        if ($LASTEXITCODE -ne 0) { die "Falha ao recriar o banco '$DbName' - veja o erro do servidor acima e reexecute." }
         ok "Banco '$DbName' recriado (utf8mb4/utf8mb4_unicode_ci)."
     } else {
-        [void](Invoke-DbSql -Sql "CREATE DATABASE ``$DbName`` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" -Password $DbAdminPassword)
-        if ($LASTEXITCODE -ne 0) { die "Falha ao criar o banco '$DbName' - verifique o acesso administrativo e reexecute (idempotente)." }
-        ok "Banco '$DbName' criado (utf8mb4/utf8mb4_unicode_ci)."
+        # Idempotente POR CONSTRUCAO: IF NOT EXISTS nao depende de consulta
+        # previa (o SELECT em information_schema.SCHEMATA provou nao confiavel
+        # em servidores novos - caso real: servidor reportando lista vazia).
+        [void](Invoke-DbSql -Sql "CREATE DATABASE IF NOT EXISTS ``$DbName`` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;" -Password $DbAdminPassword -ShowError)
+        if ($LASTEXITCODE -ne 0) { die "Falha ao criar o banco '$DbName' - veja o erro do servidor acima e reexecute (idempotente)." }
+        ok "Banco '$DbName' pronto (criado ou ja existente; utf8mb4/utf8mb4_unicode_ci)."
     }
 
-    # Usuario: reutiliza se existir, com ALINHAMENTO de senha (mesma filosofia
-    # do install.sh). No Windows/TCP sao criadas as entradas 'localhost' e '127.0.0.1'.
-    $userCount = (@(Invoke-DbSql -Sql "SELECT COUNT(*) FROM mysql.user WHERE User='$(Sql-Escape $DbUser)' AND Host IN ('localhost','127.0.0.1');" -Password $DbAdminPassword) -join '').Trim()
-    if ($userCount -eq '0') {
-        $esc = Sql-Escape $DbPassword
-        [void](Invoke-DbSql -Sql "CREATE USER IF NOT EXISTS '$DbUser'@'localhost' IDENTIFIED BY '$esc';" -Password $DbAdminPassword)
-        [void](Invoke-DbSql -Sql "CREATE USER IF NOT EXISTS '$DbUser'@'127.0.0.1' IDENTIFIED BY '$esc';" -Password $DbAdminPassword)
-        if ($LASTEXITCODE -ne 0) { die "Falha ao criar o usuario do banco '$DbUser' - verifique o acesso administrativo e reexecute." }
-        $script:DbPasswordChanged = $true
-        ok "Usuario '$DbUser' (localhost e 127.0.0.1) criado."
-    } else {
-        ok "Usuario '$DbUser' ja existe - reutilizado."
-        # Testa a senha REAL do usuario (login como o proprio usuario)
-        if (Test-DbSql -Sql 'SELECT 1;' -AsUser $DbUser -Password $DbPassword) {
-            ok 'Senha do usuario confere com a desta execucao.'
-        } elseif ($NonInteractive -or $RecreateDb) {
-            $esc = Sql-Escape $DbPassword
-            [void](Invoke-DbSql -Sql "ALTER USER '$DbUser'@'localhost' IDENTIFIED BY '$esc';" -Password $DbAdminPassword)
-            [void](Invoke-DbSql -Sql "ALTER USER '$DbUser'@'127.0.0.1' IDENTIFIED BY '$esc';" -Password $DbAdminPassword)
+    # Usuario: CREATE USER IF NOT EXISTS (idempotente) + alinhamento de senha
+    # pelo teste REAL de login. A contagem previa via mysql.user provou nao
+    # confiavel em alguns servidores novos; IF NOT EXISTS cobre todos os casos.
+    $esc = Sql-Escape $DbPassword
+    [void](Invoke-DbSql -Sql "CREATE USER IF NOT EXISTS '$DbUser'@'localhost' IDENTIFIED BY '$esc';" -Password $DbAdminPassword -ShowError)
+    [void](Invoke-DbSql -Sql "CREATE USER IF NOT EXISTS '$DbUser'@'127.0.0.1' IDENTIFIED BY '$esc';" -Password $DbAdminPassword -ShowError)
+    if ($LASTEXITCODE -ne 0) { die "Falha ao criar/garantir o usuario do banco '$DbUser' - veja o erro do servidor acima e reexecute." }
+    ok "Usuario '$DbUser' (localhost e 127.0.0.1) garantido."
+
+    # Testa a senha REAL do usuario (login como o proprio usuario): se falhar,
+    # o usuario pre-existia com outra senha e oferece o alinhamento.
+    if (-not (Test-DbSql -Sql 'SELECT 1;' -AsUser $DbUser -Password $DbPassword)) {
+        if ($NonInteractive -or $RecreateDb) {
+            [void](Invoke-DbSql -Sql "ALTER USER '$DbUser'@'localhost' IDENTIFIED BY '$esc';" -Password $DbAdminPassword -ShowError)
+            [void](Invoke-DbSql -Sql "ALTER USER '$DbUser'@'127.0.0.1' IDENTIFIED BY '$esc';" -Password $DbAdminPassword -ShowError)
             $script:DbPasswordChanged = $true
             ok "Senha do usuario '$DbUser' alinhada a desta execucao."
         } else {
             $ans = Read-Host "Senha do usuario do banco DIVERGE da digitada. Atualiza-la para a desta execucao? (S/n)"
             if ($ans -notmatch '^(n|N|no|NO|nao|NAO)\s*$') {
-                $esc = Sql-Escape $DbPassword
-                [void](Invoke-DbSql -Sql "ALTER USER '$DbUser'@'localhost' IDENTIFIED BY '$esc';" -Password $DbAdminPassword)
-                [void](Invoke-DbSql -Sql "ALTER USER '$DbUser'@'127.0.0.1' IDENTIFIED BY '$esc';" -Password $DbAdminPassword)
+                [void](Invoke-DbSql -Sql "ALTER USER '$DbUser'@'localhost' IDENTIFIED BY '$esc';" -Password $DbAdminPassword -ShowError)
+                [void](Invoke-DbSql -Sql "ALTER USER '$DbUser'@'127.0.0.1' IDENTIFIED BY '$esc';" -Password $DbAdminPassword -ShowError)
                 $script:DbPasswordChanged = $true
                 ok "Senha do usuario '$DbUser' atualizada para a desta execucao."
             } else {
                 warn 'Senha do usuario preservada - o .env usara a senha digitada; init_db() pode falhar com Access denied.'
             }
         }
+    } else {
+        ok 'Senha do usuario confere com a desta execucao.'
     }
 
     # Grants: SOMENTE no banco da aplicacao (SR-003) - idempotente
@@ -644,11 +636,41 @@ function Ensure-Repo {
 # ----------------------------------------------------------------------------
 # T008 - venv + requirements (FR-009, R8)
 # ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# Compatibilidade Windows PowerShell 5.1 (R5/R6): codigo Python passado via
+# '-c "..."' chegava ao python com as aspas duplas internas REMOVIDAS pelo
+# quoting do PS 5.1 para executaveis nativos (SyntaxError invalid syntax).
+# Solucao: gravar o codigo em arquivo temporario UTF-8 e executa-lo - nao ha
+# nenhuma passagem de codigo Python por argv. O caminho do arquivo NUNCA
+# contem credenciais (credenciais seguem por variaveis de ambiente, SR-001).
+# ----------------------------------------------------------------------------
+function Invoke-PyCode {
+    param(
+        [Parameter(Mandatory = $true)][string]$Code,
+        [string]$PythonExe = $VenvPython,
+        [string[]]$PythonArgs = @()
+    )
+    $pyFile = Join-Path ([IO.Path]::GetTempPath()) ("sispat-pycode-{0}.py" -f [Guid]::NewGuid().ToString('N'))
+    $oldPyPath = $env:PYTHONPATH
+    try {
+        [IO.File]::WriteAllText($pyFile, $Code, (New-Object System.Text.UTF8Encoding($false)))
+        # O arquivo vive no TEMP, entao sys.path[0] NAO e o diretorio atual
+        # (diferente do 'python -c', que usa o CWD). Codigos que importam
+        # app.* (contrato: CWD = projeto) precisam do CWD em sys.path;
+        # PYTHONPATH repoe isso e e restaurado no finally.
+        $env:PYTHONPATH = if ($oldPyPath) { (Get-Location).Path + ';' + $oldPyPath } else { (Get-Location).Path }
+        & $PythonExe @PythonArgs $pyFile
+    } finally {
+        if ($null -ne $oldPyPath) { $env:PYTHONPATH = $oldPyPath } else { Remove-Item Env:\PYTHONPATH -ErrorAction SilentlyContinue }
+        Remove-Item -LiteralPath $pyFile -Force -ErrorAction SilentlyContinue
+    }
+}
+
 function Test-VenvOk {
     if (-not (Test-Path $VenvPython)) { return $false }
     & $VenvPython -m pip --version *> $null
     if ($LASTEXITCODE -ne 0) { return $false }
-    & $VenvPython -c 'import fastapi, sqlalchemy, pymysql, ldap3, reportlab, openpyxl, dotenv' *> $null
+    Invoke-PyCode 'import fastapi, sqlalchemy, pymysql, ldap3, reportlab, openpyxl, dotenv, cryptography, tzdata' *> $null
     return ($LASTEXITCODE -eq 0)
 }
 
@@ -663,117 +685,34 @@ function Ensure-Venv {
     info 'Instalando requirements.txt (do repositorio recem-clonado; leva alguns minutos)...'
     & $VenvPython -m pip install --progress-bar off -r (Join-Path $InstallDir 'requirements.txt') 2>&1 | ForEach-Object { Write-Host "    $_" }
     if ($LASTEXITCODE -ne 0) { die 'pip install falhou - verifique o log e reexecute (idempotente).' }
-    & $VenvPython -c 'import fastapi, sqlalchemy, pymysql, ldap3, reportlab, openpyxl, dotenv'        if ($LASTEXITCODE -ne 0) { die 'Validacao de imports falhou apos pip install (FR-009).' }
+    # PyMySQL + MySQL 8 (caching_sha2_password) EXIGE cryptography; zoneinfo no Windows exige tzdata.
+    info 'Garantindo cryptography e tzdata (autenticacao MySQL 8 / Timezone Windows)...'
+    & $VenvPython -m pip install --progress-bar off cryptography tzdata 2>&1 | ForEach-Object { Write-Host "    $_" }
+    if ($LASTEXITCODE -ne 0) { die 'Falha ao instalar dependencias complementares (pip install cryptography tzdata).' }
+    Invoke-PyCode 'import fastapi, sqlalchemy, pymysql, ldap3, reportlab, openpyxl, dotenv, cryptography, tzdata' *> $null
+    if ($LASTEXITCODE -ne 0) { die 'Validacao de imports falhou apos pip install (FR-009).' }
     ok 'Dependencias instaladas e validadas (imports OK).'
-}
-
-# ----------------------------------------------------------------------------
-# T016-HTTPS - certificados TLS nativos (feature 061; baseline 056; contrato C2)
-# Reutiliza o mecanismo existente (scripts/gera_cert_dev.py - feature 056):
-# CA local + certificado com SAN (IP da LAN, localhost, hostname). Idempotente:
-# certificados existentes sao REUTILIZADOS (-RegenerateCert regera; a CA nova
-# exige reimportar data\ssl\ca.crt nos aparelhos). Chave privada vive em
-# data\ssl (fora do versionamento - .gitignore do PRO) e NUNCA e publicada.
-# ----------------------------------------------------------------------------
-function Find-OpenSsl {
-    $c = Get-Command openssl.exe -ErrorAction SilentlyContinue
-    if ($c) { return $c.Source }
-    $cand = Get-ChildItem 'C:\Program Files\Git\usr\bin\openssl.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($cand) { return $cand.FullName }
-    return $null
-}
-
-function Ensure-Certificates {
-    $sslDir = Join-Path $InstallDir 'data\ssl'
-    $crt = Join-Path $sslDir 'server.crt'
-    $key = Join-Path $sslDir 'server.key'
-    $gen = Join-Path $InstallDir 'scripts\gera_cert_dev.py'
-    if ((Test-Path $crt) -and (Test-Path $key) -and -not $RegenerateCert) {
-        ok 'Certificados TLS existentes - reutilizados (use -RegenerateCert para regerar).'
-        return
-    }
-    if (-not (Test-Path $gen)) { die "Gerador de certificados nao encontrado: $gen (o snapshot do PRO deve conter scripts/gera_cert_dev.py)." }
-    $openssl = Find-OpenSsl
-    if (-not $openssl) { die 'openssl nao encontrado (o Git for Windows prove openssl.exe em usr\bin; ou adicione ao PATH) e reexecute (idempotente).' }
-    if ($RegenerateCert) { warn '-RegenerateCert: a CA sera REGERADA - sera preciso reimportar data\ssl\ca.crt nos aparelhos.' }
-    info 'Gerando CA local + certificado do servidor (SAN: IP da LAN, localhost, hostname)...'
-    $opensslDir = Split-Path $openssl -Parent
-    $oldPath = $env:Path
-    try {
-        $env:Path = "$opensslDir;$oldPath"
-        Push-Location $InstallDir
-        try {
-            if ($RegenerateCert) { & $VenvPython 'scripts\gera_cert_dev.py' --force 2>&1 | ForEach-Object { Write-Host "    $_" } }
-            else                 { & $VenvPython 'scripts\gera_cert_dev.py'        2>&1 | ForEach-Object { Write-Host "    $_" } }
-        } finally { Pop-Location }
-        if ($LASTEXITCODE -ne 0) { die 'Falha ao gerar os certificados TLS - verifique a mensagem acima e reexecute (idempotente).' }
-    } finally { $env:Path = $oldPath }
-    if (-not ((Test-Path $crt) -and (Test-Path $key))) { die 'Certificados nao encontrados apos a geracao (data\ssl\server.crt / server.key).' }
-    ok 'Certificados TLS prontos em data\ssl (server.crt/server.key + ca.crt para os clientes).'
-}
-
-# Sonda LOCAL de /health sobre TLS: o certificado e emitido por CA propria e o
-# SAN nao inclui 127.0.0.1 - o bypass vale SOMENTE para esta sonda do instalador
-# (a confianca real nos clientes vem da importacao de data\ssl\ca.crt).
-function Get-LocalHealth {
-    param([int]$Port)
-    $old = [System.Net.ServicePointManager]::ServerCertificateValidationCallback
-    try {
-        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
-        [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
-        return Invoke-RestMethod -Uri ("https://127.0.0.1:{0}/health" -f $Port) -TimeoutSec 5
-    } catch { return $null }
-    finally { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $old }
 }
 
 # ----------------------------------------------------------------------------
 # T007 - montagem da URL do banco: percent-encoding programatico (nunca
 # montagem manual - R5/R6). A senha vai por AMBIENTE (nunca argv/log).
 # ----------------------------------------------------------------------------
-# 061 (M-2a): o scheme do SQLAlchemy depende do SERVIDOR REAL — 'mariadb+pymysql'
-# para MariaDB, 'mysql+pymysql' para MySQL (Oracle). O dialecto mariadb_* aplica
-# sintaxe/SQL_MODE exclusivos de MariaDB e quebraria o MySQL. Aproveita para
-# validar a faixa de versoes suportada (FR-013): MySQL >= 8.0, MariaDB >= 10.5.
-function Get-DbServerKind {
-    Resolve-DbAdminAccess
-    $ver = (@(Invoke-DbSql -Sql 'SELECT VERSION();' -Password $script:DbAdminPassword) -join '').Trim()
-    if (-not $ver) { die 'Nao foi possivel ler a versao do servidor de banco (SELECT VERSION()).' }
-    $maj = $null; $min = $null
-    if ($ver -match '(\d+)\.(\d+)') { $maj = [int]$Matches[1]; $min = [int]$Matches[2] }
-    if ($ver -match 'MariaDB') {
-        if ($null -eq $maj -or $maj -lt 10 -or ($maj -eq 10 -and $min -lt 5)) {
-            die "MariaDB $ver detectado; versao minima suportada: 10.5 (idempotencia DDL - FR-013). Atualize o servidor de banco e reexecute."
-        }
-        ok "Servidor de banco: MariaDB $ver (scheme mariadb+pymysql)."
-        return 'mariadb'
-    }
-    if ($null -eq $maj -or $maj -lt 8) {
-        die "MySQL $ver detectado; versao minima suportada: 8.0 (FR-013). Atualize o servidor de banco e reexecute."
-    }
-    ok "Servidor de banco: MySQL $ver (scheme mysql+pymysql)."
-    return 'mysql'
-}
-
 function Build-DatabaseUrl {
-    $script:DbServerKind = Get-DbServerKind
-    if ($script:DbServerKind -eq 'mysql') { $script:DbScheme = 'mysql+pymysql' } else { $script:DbScheme = 'mariadb+pymysql' }
-    # Fonte ÚNICA (feature 061/T032, FR-010): scripts/monta_database_url.py.
-    # Credenciais por VARIÁVEL DE AMBIENTE (nunca argv — SR-001); a URL é
-    # capturada — NUNCA impressa/logada (contém a senha).
-    $helper = Join-Path $InstallDir 'scripts\monta_database_url.py'
-    if (-not (Test-Path $helper)) { die "Helper de montagem da DATABASE_URL ausente: $helper (o snapshot do PRO deve conter scripts/ — publicação da 061). Reexecute após nova publicação." }
+    # Esquema do dialecto: 'mariadb+pymysql' EXIGE servidor MariaDB; em MySQL
+    # (8.x/9.x/26.x) o SQLAlchemy rejeita a conexao ("MySQL version X is not a
+    # MariaDB variant") e o correto e 'mysql+pymysql'. A familia do servidor e
+    # detectada em Ensure-Database (SELECT VERSION()) e a URL e reconstruida la.
+    if (-not $script:DbUrlScheme) { $script:DbUrlScheme = 'mariadb+pymysql' }
     $env:SP_DBUSER = $DbUser; $env:SP_DBPASS = $DbPassword
     $env:SP_DBHOST = $DbHost; $env:SP_DBPORT = $DbPort; $env:SP_DBNAME = $DbName
-    $env:SP_DBSCHEME = $script:DbScheme
     try {
-        Push-Location $InstallDir
-        try {
-            $url = (& $VenvPython 'scripts\monta_database_url.py')
-        } finally { Pop-Location }
-        if (-not $url -or $LASTEXITCODE -ne 0) { die 'Falha ao montar DATABASE_URL (percent-encoding via scripts/monta_database_url.py).' }
+        $code = 'import os; from urllib.parse import quote; print("' + $script:DbUrlScheme + '://%s:%s@%s:%s/%s" % (quote(os.environ["SP_DBUSER"], safe=""), quote(os.environ["SP_DBPASS"], safe=""), os.environ["SP_DBHOST"], os.environ["SP_DBPORT"], os.environ["SP_DBNAME"]))'
+        $url = (Invoke-PyCode $code)
+        if (-not $url -or $LASTEXITCODE -ne 0) { die 'Falha ao montar DATABASE_URL (percent-encoding via Python).' }
         $script:DatabaseUrlBuilt = ([string]$url).Trim()
     } finally {
-        Remove-Item Env:\SP_DBUSER, Env:\SP_DBPASS, Env:\SP_DBHOST, Env:\SP_DBPORT, Env:\SP_DBNAME, Env:\SP_DBSCHEME -ErrorAction SilentlyContinue
+        Remove-Item Env:\SP_DBUSER, Env:\SP_DBPASS, Env:\SP_DBHOST, Env:\SP_DBPORT, Env:\SP_DBNAME -ErrorAction SilentlyContinue
     }
     ok 'DATABASE_URL montado com percent-encoding (senha nunca em argv/log).'
 }
@@ -784,10 +723,10 @@ function Build-DatabaseUrl {
 function Test-DbConnection {
     Push-Location $InstallDir
     try {
-        & $VenvPython -c "from app.config import DATABASE_URL; from sqlalchemy import create_engine, text; e = create_engine(DATABASE_URL); c = e.connect(); print('BANCO:', c.execute(text('SELECT DATABASE()')).scalar()); c.close()" 2>&1 | ForEach-Object { Write-Host "    $_" }
+        Invoke-PyCode "from app.config import DATABASE_URL; from sqlalchemy import create_engine, text; e = create_engine(DATABASE_URL); c = e.connect(); print('BANCO:', c.execute(text('SELECT DATABASE()')).scalar()); c.close()" 2>&1 | ForEach-Object { Write-Host "    $_" }
         if ($LASTEXITCODE -ne 0) { die 'Conexao com o banco falhou via DATABASE_URL do projeto.' }
     } finally { Pop-Location }
-    ok ("Conexao validada via DATABASE_URL (" + $script:DbScheme + ").")
+    ok ("Conexao validada via DATABASE_URL (esquema " + $script:DbUrlScheme + ").")
 }
 
 # ----------------------------------------------------------------------------
@@ -799,6 +738,175 @@ function Protect-EnvFile([string]$Path) {
     & icacls $Path /inheritance:r /grant:r '*S-1-5-18:F' '*S-1-5-32-544:F' ("{0}\{1}:F" -f $env:USERDOMAIN, $env:USERNAME) *> $null
 }
 
+# ----------------------------------------------------------------------------
+# T008b - certificados SSL locais (feature 056 - HTTPS nativo no uvicorn)
+# Gera/valida CA + cert com SAN do IP da LAN via scripts\gera_cert_dev.py e
+# decide se APP_SSL_* sera gravada no .env. NAO e bloqueante: sem openssl ou
+# com falha de geracao a instalacao continua em HTTP puro (aviso claro).
+# Idempotente: certs validos (validade >= 14 dias e SAN cobrindo o IP atual)
+# sao reutilizados; invalidos sao regerados com --force (CA NOVA - avisa que
+# os aparelhos precisam reimportar ca.crt).
+# ----------------------------------------------------------------------------
+function Ensure-SslCerts {
+    $script:SslEnabled = $false
+    if ($SkipSsl) {
+        warn '-SkipSsl: etapa pulada - a aplicacao sobe em HTTP puro (sem APP_SSL_*).'
+        return
+    }
+    $sslDir    = Join-Path $InstallDir 'data\ssl'
+    $caCrt     = Join-Path $sslDir 'ca.crt'
+    $srvCrt    = Join-Path $sslDir 'server.crt'
+    $srvKey    = Join-Path $sslDir 'server.key'
+    $genScript = Join-Path $InstallDir 'scripts\gera_cert_dev.py'
+    if (-not (Test-Path $genScript)) {
+        warn "scripts\gera_cert_dev.py nao encontrado - HTTPS pulado (HTTP puro)."
+        return
+    }
+    # openssl no PATH do processo filho: PATH primeiro, depois locais comuns
+    # (Git for Windows). Cobre clone NOVO cujo gera_cert_dev.py ainda nao tem
+    # o acha_openssl do projeto.
+    $opensslDir = $null
+    if (-not (Get-Command openssl -ErrorAction SilentlyContinue)) {
+        # ProgramW6432: num PowerShell 32-bit o ProgramFiles aponta para
+        # 'Program Files (x86)' e o Git/openssl ficariam invisiveis (causaria
+        # downgrade silencioso para HTTP puro nesta execucao).
+        foreach ($d in @(
+            (Join-Path $env:ProgramW6432 'Git\usr\bin'),
+            (Join-Path $env:ProgramW6432 'Git\mingw64\bin'),
+            (Join-Path $env:ProgramFiles 'Git\usr\bin'),
+            (Join-Path $env:ProgramFiles 'Git\mingw64\bin'),
+            'C:\Program Files\OpenSSL-Win64\bin',
+            'C:\OpenSSL-Win64\bin'
+        )) {
+            if ($d -and (Test-Path (Join-Path $d 'openssl.exe'))) { $opensslDir = $d; break }
+        }
+        if (-not $opensslDir) {
+            warn 'openssl CLI nao encontrado (PATH nem Git for Windows) - HTTPS pulado. Instale o Git for Windows para habilitar.'
+            return
+        }
+    }
+    # IP da LAN sem trafego real (mesma heuristica do gera_cert_dev.py)
+    $ip = $null
+    try {
+        $udp = New-Object System.Net.Sockets.UdpClient
+        try { $udp.Connect('10.255.255.255', 1); $ip = ([System.Net.IPEndPoint]$udp.Client.LocalEndPoint).Address.ToString() } finally { $udp.Close() }
+    } catch { }
+    if ($ip -match '^(127\.|169\.254\.)') { $ip = $null }
+    if ($ip) { info "IP da LAN para o SAN: $ip" }
+
+    # Validacao idempotente (cryptography do proprio venv - ja e dependencia):
+    # legivel + validade >= 14 dias + SAN cobrindo o IP atual da LAN.
+    if ((Test-Path $caCrt) -and (Test-Path $srvCrt) -and (Test-Path $srvKey)) {
+        $env:SP_SSL_CERT = $srvCrt
+        if ($ip) { $env:SP_SSL_IP = $ip } else { Remove-Item Env:\SP_SSL_IP -ErrorAction SilentlyContinue }
+        $pyCheck = @'
+import os, sys
+from datetime import datetime, timezone
+from cryptography import x509
+from cryptography.hazmat.backends import default_backend
+from cryptography.x509.oid import ExtensionOID
+try:
+    with open(os.environ['SP_SSL_CERT'], 'rb') as f:
+        cert = x509.load_pem_x509_certificate(f.read(), default_backend())
+except Exception as e:
+    print('cert ilegivel: %s' % e); sys.exit(3)
+try:
+    fim = cert.not_valid_after_utc
+except AttributeError:
+    fim = cert.not_valid_after.replace(tzinfo=timezone.utc)
+dias = (fim - datetime.now(timezone.utc)).days
+if dias < 14:
+    print('cert expira em %d dia(s)' % dias); sys.exit(4)
+try:
+    san = cert.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME).value
+except Exception:
+    print('cert sem SAN'); sys.exit(5)
+alvo = os.environ.get('SP_SSL_IP', '')
+if alvo:
+    ips = [str(x) for x in san.get_values_for_type(x509.IPAddress)]
+    dns = list(san.get_values_for_type(x509.DNSName))
+    if alvo not in ips and alvo not in dns:
+        print('SAN nao cobre o IP atual %s (SAN tem: %s)' % (alvo, ','.join(ips + dns))); sys.exit(6)
+print('ok')
+'@
+        try {
+            Invoke-PyCode $pyCheck 2>&1 | ForEach-Object { info "  ssl-check: $_" }
+            $valido = ($LASTEXITCODE -eq 0)
+        } finally {
+            Remove-Item Env:\SP_SSL_CERT, Env:\SP_SSL_IP -ErrorAction SilentlyContinue
+        }
+        if ($valido) {
+            $script:SslEnabled = $true
+            ok 'Certificados SSL existentes validos (SAN/validade) - reutilizados.'
+            return
+        }
+        warn 'Certificados SSL existentes invalidos, expirados ou sem o IP atual no SAN - regerando (CA NOVA: reimporte ca.crt nos aparelhos).'
+    }
+
+    $pyArgs = @($genScript)
+    if ($ip) { $pyArgs += @('--ip', $ip) }
+    if ((Test-Path $srvCrt) -or (Test-Path $caCrt) -or (Test-Path $srvKey)) { $pyArgs += '--force' }
+    $oldPath = $env:PATH
+    try {
+        if ($opensslDir) { $env:PATH = "$oldPath;$opensslDir" }
+        & $VenvPython @pyArgs 2>&1 | ForEach-Object { info "  gera-cert: $_" }
+    } finally {
+        $env:PATH = $oldPath
+    }
+    if ($LASTEXITCODE -ne 0 -or -not ((Test-Path $caCrt) -and (Test-Path $srvCrt) -and (Test-Path $srvKey))) {
+        warn 'Geracao de certificados SSL falhou - instalacao continua em HTTP puro (veja saida acima).'
+        return
+    }
+    $script:SslEnabled = $true
+    ok 'Certificados SSL gerados em data\ssl - a aplicacao subira em HTTPS.'
+}
+
+# Grava/remove APP_SSL_CERTFILE+APP_SSL_KEYFILE no .env conforme Ensure-SslCerts.
+# run.py FALHA NO BOOT se as chaves existirem e os arquivos nao - por isso as
+# chaves sao REMOVIDAS quando SSL esta desligado e os arquivos nao existem.
+# Caminhos relativos com '/' (docs/HTTPS_LOCAL.md: o app normaliza contra a
+# raiz do projeto - o mesmo .env vale no Windows e no Linux).
+function Sync-SslEnvKeys([string]$EnvFile) {
+    if (-not (Test-Path $EnvFile)) { return }
+    $lines = @(Get-Content $EnvFile)
+    $temCert = (@($lines | Where-Object { $_ -match '^APP_SSL_CERTFILE=' }).Count -gt 0)
+    $temKey  = (@($lines | Where-Object { $_ -match '^APP_SSL_KEYFILE=' }).Count -gt 0)
+    if ($script:SslEnabled) {
+        $newLines = @()
+        $addCert = -not $temCert
+        $addKey  = -not $temKey
+        foreach ($l in $lines) {
+            if ($l -match '^APP_SSL_CERTFILE=') { $newLines += 'APP_SSL_CERTFILE=data/ssl/server.crt' }
+            elseif ($l -match '^APP_SSL_KEYFILE=') { $newLines += 'APP_SSL_KEYFILE=data/ssl/server.key' }
+            else { $newLines += $l }
+        }
+        if ($addCert) { $newLines += 'APP_SSL_CERTFILE=data/ssl/server.crt' }
+        if ($addKey)  { $newLines += 'APP_SSL_KEYFILE=data/ssl/server.key' }
+        if ($addCert -or $addKey) {
+            Set-Content -Path $EnvFile -Value $newLines -Encoding UTF8 -ErrorAction Stop
+            ok 'HTTPS ativado: APP_SSL_CERTFILE/APP_SSL_KEYFILE gravadas no .env.'
+        }
+        return
+    }
+    if ($temCert -or $temKey) {
+        $caminho = $null
+        foreach ($l in $lines) { if ($l -match '^APP_SSL_CERTFILE=(.+)$') { $caminho = $Matches[1].Trim(); break } }
+        $existe = $false
+        if ($caminho) {
+            $p = $caminho -replace '/', '\'
+            if ($p -notmatch '^[A-Za-z]:\\') { $p = Join-Path $InstallDir $p }
+            $existe = Test-Path $p
+        }
+        if (-not $existe) {
+            $newLines = @($lines | Where-Object { $_ -notmatch '^APP_SSL_(CERTFILE|KEYFILE)=' })
+            Set-Content -Path $EnvFile -Value $newLines -Encoding UTF8 -ErrorAction Stop
+            warn 'SSL desligado e certificados inexistentes: chaves APP_SSL_* removidas do .env (evita falha de boot do run.py).'
+        } else {
+            info 'SSL desligado nesta execucao, mas os certificados existem - chaves APP_SSL_* mantidas no .env.'
+        }
+    }
+}
+
 function Ensure-EnvFile {
     $envFile = Join-Path $InstallDir '.env'
     if (Test-Path $envFile) {
@@ -806,6 +914,10 @@ function Ensure-EnvFile {
         warn '.env existente - NUNCA e sobrescrito.'
         Copy-Item $envFile $bak -Force -ErrorAction Stop
         ok "Backup criado: $bak"
+        $existingKeys = @(Get-Content $envFile | ForEach-Object { if ($_ -match '^([A-Za-z_][A-Za-z0-9_]*)=') { $Matches[1] } })
+        if ($existingKeys -contains 'DB_ROOT_PASSWORD') {
+            warn '.env parece da variante Docker (chaves DB_* do compose) - a app nativa le DATABASE_URL, APP_HOST e APP_PORT.'
+        }
         # Caso real: reexecucao apos falha no meio da instalacao - oferece
         # atualizar APENAS o DATABASE_URL quando o banco mudou NESTA execucao.
         if (-not $NonInteractive -and $DbPasswordChanged) {
@@ -813,11 +925,25 @@ function Ensure-EnvFile {
             if ($ans -notmatch '^(n|N|no|NO|nao|NAO)\s*$') {
                 # Reescrita linha a linha: -replace com a URL no lado direito
                 # interpretaria '$' da senha como referencia a grupo de captura
-                $newLines = foreach ($l in (Get-Content $envFile)) {
-                    if ($l -match '^DATABASE_URL=') { "DATABASE_URL=$DatabaseUrlBuilt" } else { $l }
+                $foundUrl = $false
+                $newLines = @()
+                foreach ($l in (Get-Content $envFile)) {
+                    if ($l -match '^DATABASE_URL=') { $foundUrl = $true; $newLines += "DATABASE_URL=$DatabaseUrlBuilt" }
+                    else { $newLines += $l }
                 }
-                Set-Content -Path $envFile -Value $newLines -Encoding UTF8 -ErrorAction Stop
-                ok 'DATABASE_URL atualizado no .env existente (demais chaves preservadas).'
+                if (-not $foundUrl) {
+                    # .env pode existir SEM a chave (caso real: .env da variante Docker)
+                    $newLines += "DATABASE_URL=$DatabaseUrlBuilt"
+                    if (-not ($existingKeys -contains 'MYSQLDUMP_PATH') -and $DbClient) {
+                        $dump = Join-Path ([IO.Path]::GetDirectoryName($DbClient)) 'mysqldump.exe'
+                        if (Test-Path $dump) { $newLines += "MYSQLDUMP_PATH=$dump"; ok 'MYSQLDUMP_PATH adicionado (backups pela aplicacao).' }
+                    }
+                    Set-Content -Path $envFile -Value $newLines -Encoding UTF8 -ErrorAction Stop
+                    ok 'DATABASE_URL ADICIONADO ao .env existente (chave ausente; demais chaves preservadas).'
+                } else {
+                    Set-Content -Path $envFile -Value $newLines -Encoding UTF8 -ErrorAction Stop
+                    ok 'DATABASE_URL atualizado no .env existente (demais chaves preservadas).'
+                }
             } else {
                 warn '.env mantido sem alteracoes (valores existentes preservados).'
             }
@@ -829,41 +955,57 @@ function Ensure-EnvFile {
                 if (-not ($lines -match '^DATABASE_URL=')) { Add-Content $envFile "DATABASE_URL=$DatabaseUrlBuilt" }
                 if (-not ($lines -match '^APP_HOST='))     { Add-Content $envFile "APP_HOST=$AppHost" }
                 if (-not ($lines -match '^APP_PORT='))     { Add-Content $envFile "APP_PORT=$AppPort" }
-                # HTTPS (061): ausente OU vazia e tratada como ausente - sem
-                # passo manual pos-instalacao (SC-003)
-                if (-not ($lines -match '^APP_SSL_CERTFILE=.'))   { Add-Content $envFile 'APP_SSL_CERTFILE=data/ssl/server.crt' }
-                if (-not ($lines -match '^APP_SSL_KEYFILE=.'))    { Add-Content $envFile 'APP_SSL_KEYFILE=data/ssl/server.key' }
-                if (-not ($lines -match '^AUTH_COOKIE_SECURE=.')) { Add-Content $envFile 'AUTH_COOKIE_SECURE=true' }
                 ok 'Chaves ausentes adicionadas ao .env existente.'
             } else { warn '.env mantido sem alteracoes (valores existentes preservados).' }
+
+            # Sincronizacao: mesmo com senha inalterada, o DATABASE_URL existente
+            # pode divergir da URL desta execucao (caso real: dialecto errado
+            # mariadb+pymysql gravado antes da deteccao de familia do servidor).
+            # A URL NUNCA e impressa (contem senha - SR-001).
+            $curUrl = $null
+            foreach ($l in (Get-Content $envFile)) { if ($l -match '^DATABASE_URL=(.+)$') { $curUrl = $Matches[1].Trim(); break } }
+            if ($curUrl -and $curUrl -cne $DatabaseUrlBuilt) {
+                warn 'DATABASE_URL no .env difere da URL montada NESTA execucao (dialeto/host/porta/senha).'
+                $ans2 = Read-Host 'Sincronizar o DATABASE_URL do .env com a desta execucao? (S/n)'
+                if ($ans2 -notmatch '^(n|N|no|NO|nao|NAO)\s*$') {
+                    $newLines = @()
+                    foreach ($l in (Get-Content $envFile)) {
+                        if ($l -match '^DATABASE_URL=') { $newLines += "DATABASE_URL=$DatabaseUrlBuilt" } else { $newLines += $l }
+                    }
+                    Set-Content -Path $envFile -Value $newLines -Encoding UTF8 -ErrorAction Stop
+                    ok 'DATABASE_URL sincronizado com a URL desta execucao.'
+                } else {
+                    warn 'DATABASE_URL mantido - se o teste de conexao falhar por dialecto/credencial, esta e a causa.'
+                }
+            }
         } else {
             warn 'Modo nao interativo: .env mantido sem alteracoes (valores existentes preservados).'
+            $curUrl = $null
+            foreach ($l in (Get-Content $envFile)) { if ($l -match '^DATABASE_URL=(.+)$') { $curUrl = $Matches[1].Trim(); break } }
+            if ($curUrl -and $curUrl -cne $DatabaseUrlBuilt) {
+                warn 'DATABASE_URL do .env difere da URL desta execucao - o teste de conexao pode falhar.'
+            }
         }
+        Sync-SslEnvKeys $envFile
         Protect-EnvFile $envFile
         return
     }
 
     $content = @"
-# Gerado por install.ps1 (features 027/061 - Windows) em $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+# Gerado por install.ps1 (feature 027 - Windows) em $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
 # Conexao com o banco MariaDB/MySQL (obrigatoria - a aplicacao nao inicia sem ela)
 DATABASE_URL=$DatabaseUrlBuilt
 
 # Bind da aplicacao
 APP_HOST=$AppHost
 APP_PORT=$AppPort
-
-# HTTPS nativo (features 056/061 - TLS no proprio servidor; contrato C2 da 061)
-APP_SSL_CERTFILE=data/ssl/server.crt
-APP_SSL_KEYFILE=data/ssl/server.key
-
-# Cookie de sessao enviado SOMENTE por HTTPS (obrigatorio com HTTPS ativo)
-AUTH_COOKIE_SECURE=true
 "@
     if ($DbClient) {
         $dump = Join-Path ([IO.Path]::GetDirectoryName($DbClient)) 'mysqldump.exe'
         if (Test-Path $dump) { $content += "`n`n# Caminho do mysqldump (backup/restauracao pela aplicacao)`nMYSQLDUMP_PATH=$dump" }
     }
     Set-Content -Path $envFile -Value $content -Encoding UTF8 -ErrorAction Stop
+    Sync-SslEnvKeys $envFile
     Protect-EnvFile $envFile
     ok '.env gerado com ACL restrita (equivalente 0600 - SR-002).'
 }
@@ -925,7 +1067,7 @@ function Init-Database {
     info 'Executando init_db() do projeto (create_all + migracoes leves)...'
     Push-Location $InstallDir
     try {
-        & $VenvPython -c 'from app.database import init_db; init_db()' 2>&1 | ForEach-Object { Write-Host "    $_" }
+        Invoke-PyCode 'from app.database import init_db; init_db()' 2>&1 | ForEach-Object { Write-Host "    $_" }
         if ($LASTEXITCODE -ne 0) {
             die 'init_db() falhou - verificar DATABASE_URL/.env e acesso do usuario do banco. Instalacao interrompida (nenhum dado alterado).'
         }
@@ -936,19 +1078,59 @@ function Init-Database {
 # ----------------------------------------------------------------------------
 # T011 - start + health (FR-013, R11)
 # ----------------------------------------------------------------------------
+# Health probe consciente do esquema: com HTTPS ativo o run.py serve SOMENTE
+# TLS, entao http://127.0.0.1 falharia. PS 5.1 nao tem -SkipCertificateCheck:
+# confia no cert autoassinado LOCAL via ServerCertificateValidationCallback
+# com RESTAURACAO do valor anterior (try/finally) - sem isso o cert derrubaria
+# o probe e a etapa morreria em timeout.
+#
+# O ESQUEMA efetivo vem do .env (run.py lige o .env, nao esta execucao): se
+# APP_SSL_* aponta para arquivos existentes, o app serve TLS mesmo quando ESTA
+# execucao pulou o SSL - o probe tem que acompanhar o que o app realmente faz
+# (divergencia = timeout de 120s na etapa de health).
+function Test-EnvSslActive {
+    $envFile = Join-Path $InstallDir '.env'
+    if (-not (Test-Path $envFile)) { return $false }
+    $cert = $null
+    foreach ($l in (Get-Content $envFile)) { if ($l -match '^APP_SSL_CERTFILE=(.+)$') { $cert = $Matches[1].Trim(); break } }
+    if (-not $cert) { return $false }
+    $p = $cert -replace '/', '\'
+    if ($p -notmatch '^[A-Za-z]:\\') { $p = Join-Path $InstallDir $p }
+    return [bool](Test-Path $p)
+}
+
+function Get-HealthUri {
+    $scheme = if ($script:SslEnabled -or (Test-EnvSslActive)) { 'https' } else { 'http' }
+    return "${scheme}://127.0.0.1:$AppPort/health"
+}
+
+function Invoke-HealthProbe([int]$TimeoutSec = 5) {
+    if ((Get-HealthUri) -notlike 'https://*') { return Invoke-RestMethod -Uri (Get-HealthUri) -TimeoutSec $TimeoutSec }
+    # PS5.1: um scriptblock '{ $true }' NAO serve como callback - o delegate e
+    # invocado numa thread de rede SEM runspace ("No Runspace available"). E
+    # '[Tipo]::Metodo' tambem falha (PSMethod nao converte para delegate):
+    # a classe C# expoe o PROPRIO delegate como campo static readonly - unica
+    # forma validada em prova de campo contra uvicorn com cert autoassinado.
+    if (-not ('SispatSslTrust' -as [type])) {
+        Add-Type -TypeDefinition 'using System.Net.Security; using System.Security.Cryptography.X509Certificates; public static class SispatSslTrust { public static readonly RemoteCertificateValidationCallback Callback = new RemoteCertificateValidationCallback(TrustAll); public static bool TrustAll(object sender, X509Certificate cert, X509Chain chain, SslPolicyErrors errors) { return true; } }' -ErrorAction Stop
+    }
+    $prev = [System.Net.ServicePointManager]::ServerCertificateValidationCallback
+    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = [SispatSslTrust]::Callback
+    try { return Invoke-RestMethod -Uri (Get-HealthUri) -TimeoutSec $TimeoutSec }
+    finally { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $prev }
+}
+
 function Start-AndHealthCheck {
     Start-ScheduledTask -TaskName $ServiceName -ErrorAction Stop
     info "Aguardando /health (ate ${HealthTimeoutSeconds}s)..."
     $waited = 0
     while ($waited -lt $HealthTimeoutSeconds) {
         try {
-            $r = Get-LocalHealth -Port ([int]$AppPort)
-            if ($null -ne $r) {
-                switch ($r.status) {
-                    'healthy'  { ok 'Aplicacao saudavel: /health -> healthy (HTTPS)'; return }
-                    'degraded' { warn '/health -> degraded (aplicacao no ar; componente informado no corpo da resposta, ex.: AD configurado e indisponivel). Instalacao prossegue.'; return }
-                    default    { info ("status=$($r.status) - aguardando...") }
-                }
+            $r = Invoke-HealthProbe
+            switch ($r.status) {
+                'healthy'  { ok 'Aplicacao saudavel: /health -> healthy'; return }
+                'degraded' { warn '/health -> degraded (aplicacao no ar; componente informado no corpo da resposta, ex.: AD configurado e indisponivel). Instalacao prossegue.'; return }
+                default    { info ("status=$($r.status) - aguardando...") }
             }
         } catch { }
         Start-Sleep -Seconds 2
@@ -985,17 +1167,17 @@ function Post-InstallChecks {
     # Mesmo contrato da tarefa (WorkingDirectory): imports de app.* exigem CWD = projeto
     Push-Location $InstallDir
     try {
-        & $VenvPython -c "from app.database import SessionLocal; from sqlalchemy import text; db = SessionLocal(); db.execute(text('SELECT 1')); db.close()" *> $null
+        Invoke-PyCode "from app.database import SessionLocal; from sqlalchemy import text; db = SessionLocal(); db.execute(text('SELECT 1')); db.close()" *> $null
         if ($LASTEXITCODE -eq 0) { ok 'Conexao com o banco: OK' } else { err 'Conexao com o banco: FALHOU'; $failures++ }
-        & $VenvPython -c "from app.database import SessionLocal; from sqlalchemy import text; db = SessionLocal(); db.execute(text('SELECT 1 FROM users LIMIT 1')); db.close()" *> $null
+        Invoke-PyCode "from app.database import SessionLocal; from sqlalchemy import text; db = SessionLocal(); db.execute(text('SELECT 1 FROM users LIMIT 1')); db.close()" *> $null
         if ($LASTEXITCODE -eq 0) { ok 'Tabela base (users) existente: OK' } else { err 'Tabela base: FALHOU'; $failures++ }
     } finally { Pop-Location }
 
     $task = Get-ScheduledTask -TaskName $ServiceName -ErrorAction SilentlyContinue
     if ($task -and $task.State -eq 'Running') { ok "Tarefa $ServiceName ativa: OK" } else { err 'Tarefa ativa: FALHOU'; $failures++ }
 
-    if (Get-LocalHealth -Port ([int]$AppPort)) { ok 'HTTPS /health: OK' }
-    else { err 'HTTPS /health: FALHOU'; $failures++ }
+    try { Invoke-HealthProbe | Out-Null; ok ((Get-HealthUri) + ': OK') }
+    catch { err ((Get-HealthUri) + ': FALHOU'); $failures++ }
 
     if ($failures -gt 0) { die "$failures verificacao(oes) pos-instalacao falharam - veja mensagens acima e o log." }
     ok 'Bateria completa: todas as verificacoes passaram.'
@@ -1040,10 +1222,13 @@ function Print-Summary {
     Write-Host '  ==============================================================' -ForegroundColor White
     Write-Host ''
     Write-Host '  ACESSO' -ForegroundColor White
-    Write-Host ("    Aplicacao    : https://{0}:{1}" -f $ip, $AppPort)
-    Write-Host ("    Swagger API  : https://{0}:{1}/docs" -f $ip, $AppPort)
-    Write-Host ("    Health check : https://{0}:{1}/health" -f $ip, $AppPort)
-    Write-Host '    CA dos clientes: data\ssl\ca.crt (importe nos aparelhos para confiar no HTTPS - 1x)'
+    $esq = if ($script:SslEnabled) { 'https' } else { 'http' }
+    Write-Host ("    Aplicacao    : {0}://{1}:{2}" -f $esq, $ip, $AppPort)
+    Write-Host ("    Swagger API  : {0}://{1}:{2}/docs" -f $esq, $ip, $AppPort)
+    Write-Host ("    Health check : {0}://{1}:{2}/health" -f $esq, $ip, $AppPort)
+    if ($script:SslEnabled) {
+        Write-Host ('    HTTPS        : importe ' + (Join-Path $InstallDir 'data\ssl\ca.crt') + ' como CA confiavel nos aparelhos (1x).')
+    }
     Write-Host ''
     Write-Host '  INSTALACAO' -ForegroundColor White
     Write-Host ('    Diretorio    : ' + $InstallDir)
@@ -1074,114 +1259,12 @@ function Print-Summary {
 }
 
 # ----------------------------------------------------------------------------
-# 061/CS-5 - atualizacao de instalacao existente (-Update): codigo + dependencias
-# + schema + reinicio. .env e dados NUNCA tocados; arvore suja ABORTA (o
-# instalador nunca reverte codigo); pull e --ff-only (nunca merge/force).
-# ----------------------------------------------------------------------------
-function Read-EnvValue {
-    param([string]$Path, [string]$Key, [string]$Default = '')
-    if (-not (Test-Path $Path)) { return $Default }
-    $line = Get-Content $Path | Where-Object { $_ -match ('^' + [regex]::Escape($Key) + '=') } | Select-Object -First 1
-    if (-not $line) { return $Default }
-    return ((($line -split '=', 2)[1]).Trim().Trim('"').Trim("'"))
-}
-
-function Update-CheckExisting {
-    $miss = @()
-    if (-not (Test-Path (Join-Path $InstallDir '.git')))     { $miss += '.git (clone)' }
-    if (-not (Test-Path $VenvPython))                        { $miss += '.venv\Scripts\python.exe' }
-    if (-not (Test-Path (Join-Path $InstallDir '.env')))     { $miss += '.env' }
-    if (-not (Test-Path (Join-Path $InstallDir 'run.py')))   { $miss += 'run.py' }
-    if ($miss.Count -gt 0) {
-        die ("-Update exige uma instalacao existente em $InstallDir (ausente: " + ($miss -join ', ') + "). Para primeira instalacao, execute sem -Update; para reparo, reexecute o instalador completo.")
-    }
-    # O .env e a fonte de verdade da instalacao: porta/bind reais para o health.
-    $envFile = Join-Path $InstallDir '.env'
-    $port = Read-EnvValue -Path $envFile -Key 'APP_PORT'
-    if ($port) { $script:AppPort = $port }
-    # Servico do banco (a bateria pos-atualizacao referencia o nome)
-    $svc = Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^(MariaDB|MySQL)' -or $_.DisplayName -match '^(MariaDB|MySQL)' } | Select-Object -First 1
-    if ($svc) { $script:DbServiceName = $svc.Name }
-    ok "Instalacao existente valida em $InstallDir - .env e dados PRESERVADOS (porta da app: $AppPort)."
-}
-
-function Update-Repo {
-    $dirty = (& git -C $InstallDir status --porcelain 2>$null)
-    if ($dirty) {
-        warn 'A arvore do clone possui alteracoes locais (git status nao vazio).'
-        die 'Atualizacao abortada: o instalador NUNCA reverte codigo - resolva as alteracoes locais (commit/stash) manualmente e reexecute -Update.'
-    }
-    & git -C $InstallDir fetch origin $BranchValue 2>&1 | ForEach-Object { Write-Host "    $_" }
-    if ($LASTEXITCODE -ne 0) { die 'git fetch falhou (rede/repositorio) - nenhuma alteracao aplicada; reexecute -Update mais tarde.' }
-    $remote = (& git -C $InstallDir rev-parse "origin/$BranchValue" 2>$null)
-    if (-not $remote) { die "Branch remota 'origin/$BranchValue' nao encontrada apos o fetch." }
-    $localShort = (& git -C $InstallDir rev-parse --short HEAD 2>$null)
-    if (([string](& git -C $InstallDir rev-parse HEAD 2>$null)).Trim() -eq (([string]$remote).Trim())) {
-        ok "Codigo ja atualizado (HEAD = origin/$BranchValue) - nada a aplicar."
-        return
-    }
-    & git -C $InstallDir pull --ff-only origin $BranchValue 2>&1 | ForEach-Object { Write-Host "    $_" }
-    if ($LASTEXITCODE -ne 0) { die 'pull --ff-only falhou (historico divergido) - nenhuma alteracao aplicada. Resolva a divergencia manualmente e reexecute -Update.' }
-    ok ("Codigo atualizado: {0} -> {1}." -f $localShort, (& git -C $InstallDir rev-parse --short HEAD 2>$null))
-}
-
-function Update-VenvDeps {
-    info 'Sincronizando dependencias (pip install -r requirements.txt; idempotente)...'
-    Push-Location $InstallDir
-    try {
-        & $VenvPython -m pip install --progress-bar off -r (Join-Path $InstallDir 'requirements.txt') 2>&1 | ForEach-Object { Write-Host "    $_" }
-        if ($LASTEXITCODE -ne 0) { die 'pip install falhou na atualizacao - o codigo NAO foi revertido; resolva (ex.: rede) e reexecute -Update.' }
-    } finally { Pop-Location }
-    ok 'Dependencias sincronizadas.'
-}
-
-function Print-UpdateSummary {
-    $ip = Get-PrimaryIPv4
-    Write-Host ''
-    Write-Host '  ==============================================================' -ForegroundColor White
-    ok 'SisPatrimonio Pro atualizado com sucesso (WINDOWS nativo)!'
-    Write-Host '  ==============================================================' -ForegroundColor White
-    Write-Host ''
-    Write-Host ("    Aplicacao    : https://{0}:{1}" -f $ip, $AppPort)
-    Write-Host ("    Health check : https://{0}:{1}/health" -f $ip, $AppPort)
-    Write-Host ('    Diretorio    : ' + $InstallDir)
-    Write-Host ('    Tarefa       : ' + $ServiceName + ' (reiniciada ao final da atualizacao)')
-    Write-Host '    .env e dados de producao: PRESERVADOS (a atualizacao nunca os altera).'
-    Write-Host ''
-}
-
-function Update-Main {
-    $script:TotalSteps = 8
-    $Script:StepNo = 0
-
-    Write-Host ''
-    Write-Host '=============================================================='
-    info "SisPatrimonio Pro - ATUALIZACAO WINDOWS (nativo) v$AppVersionInstaller ($(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))"
-    Write-Host '=============================================================='
-    Write-Host ''
-
-    Write-Step 'Verificacao da instalacao existente'  ; Update-CheckExisting
-    Write-Step 'Verificacao de conectividade'          ; Test-Connectivity
-    Write-Step 'Codigo-fonte (fetch + pull --ff-only)' ; Update-Repo
-    Write-Step 'Dependencias (pip install -r)'         ; Update-VenvDeps
-    Write-Step 'Parada da tarefa de rodada anterior'   ; Stop-ServiceTaskIfRunning
-    Write-Step 'Atualizacao do schema (init_db)'       ; Init-Database
-    Write-Step 'Start + health check'                  ; Start-AndHealthCheck
-    Write-Step 'Bateria pos-atualizacao'               ; Post-InstallChecks
-
-    Print-UpdateSummary
-    ok 'Atualizacao concluida.'
-}
-
-# ----------------------------------------------------------------------------
 # main
 # ----------------------------------------------------------------------------
 function Main {
     Parse-Args
     Validate-Inputs
     Require-Admin
-
-    if ($Update) { Update-Main; return }
 
     Write-Host ''
     Write-Host '=============================================================='
@@ -1197,13 +1280,13 @@ function Main {
     Confirm-Plan
     Confirm-RecreateDb
 
-    Write-Step 'Pacotes do sistema (Python, Git, MySQL Server)' ; Ensure-Packages
+    Write-Step 'Pacotes do sistema (Python, Git, MariaDB)' ; Ensure-Packages
     Write-Step 'Verificacao de conectividade'              ; Test-Connectivity
     Write-Step 'Codigo-fonte (clone)'                      ; Ensure-Repo
     Write-Step 'Ambiente virtual e dependencias'           ; Ensure-Venv
-    Write-Step 'Certificados TLS (HTTPS nativo)'           ; Ensure-Certificates
     Write-Step 'Montagem da URL do banco'                  ; Build-DatabaseUrl
     Write-Step 'Banco de dados (criacao/validacao)'        ; Ensure-Database
+    Write-Step 'Certificados SSL (HTTPS local)'            ; Ensure-SslCerts
     Write-Step 'Arquivo de configuracao .env'              ; Ensure-EnvFile
     Write-Step 'Teste de conexao com o banco'              ; Test-DbConnection
     Write-Step 'Tarefa agendada (servico)'                 ; Ensure-ServiceTask
@@ -1217,16 +1300,10 @@ function Main {
     # Regra de firewall para acesso via rede (idempotente por nome; sem ela
     # o Windows bloqueia a porta por padrao - divergencia necessaria do Linux)
     if ($AppHost -ne '127.0.0.1') {
-        # Remove regras orfas de execucoes anteriores com porta diferente (D-12)
-        Get-NetFirewallRule -DisplayName 'SisPatrimonio Pro (*)' -ErrorAction SilentlyContinue |
-            Where-Object { $_.DisplayName -ne "SisPatrimonio Pro ($AppPort)" } |
-            Remove-NetFirewallRule -ErrorAction SilentlyContinue
         $fw = Get-NetFirewallRule -DisplayName "SisPatrimonio Pro ($AppPort)" -ErrorAction SilentlyContinue
         if (-not $fw) {
             New-NetFirewallRule -DisplayName "SisPatrimonio Pro ($AppPort)" -Direction Inbound -Action Allow -Protocol TCP -LocalPort ([int]$AppPort) -ErrorAction Stop | Out-Null
             ok "Regra de firewall de entrada criada para a porta $AppPort (acesso via rede)."
-        } else {
-            ok "Regra de firewall de entrada ja existente para a porta $AppPort (idempotente)."
         }
     }
 

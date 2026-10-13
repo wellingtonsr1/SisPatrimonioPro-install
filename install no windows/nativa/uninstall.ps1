@@ -174,9 +174,19 @@ function Resolve-DbAdminAccess {
             return
         }
     }
-    $p = Read-Secret 'Senha de root do MariaDB/MySQL (sem eco; vazia nas duas = tentar senha vazia): '
+    $p = Read-Secret 'Senha de root do MariaDB/MySQL (sem eco; vazia nas duas = tentar senha vazia)'
     if (-not $p) { $p = '' }
+    if ($p -eq '') { warn 'Nenhuma senha digitada - sera tentada a senha VAZIA do root (digite a senha para autenticar de verdade).' }
     if (-not (Test-DbSql -Sql 'SELECT 1;' -Password $p)) {
+        # Diagnostico: erro REAL do servidor (nunca contem a senha - SR-001).
+        warn 'Erro retornado pelo servidor:'
+        $env:MYSQL_PWD = $p
+        try {
+            & $script:DbClient @('--user', 'root', '--host', $script:DbHost, '--port', $script:DbPort, '-N', '-B', '-e', 'SELECT 1;') 2>&1 |
+                ForEach-Object { err ('  ' + $_.ToString().Trim()) }
+        } finally {
+            Remove-Item Env:\MYSQL_PWD -ErrorAction SilentlyContinue
+        }
         die 'Credencial de root invalida. Verifique a senha e reexecute (idempotente).'
     }
     $script:DbAdminPassword = $p
@@ -185,7 +195,7 @@ function Resolve-DbAdminAccess {
 
 function Read-Secret([string]$Prompt) {
     $p1 = Read-Host -AsSecureString $Prompt
-    $p2 = Read-Host -AsSecureString 'Confirme a senha (vazio nas duas = tentar senha vazia):'
+    $p2 = Read-Host -AsSecureString 'Confirme a senha (vazio nas duas = tentar senha vazia)'
     if ($p1.Length -eq 0 -and $p2.Length -eq 0) { return '' }
     $b1 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($p1)
     $b2 = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($p2)

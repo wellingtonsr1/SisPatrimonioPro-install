@@ -31,6 +31,8 @@ Os scripts são **idempotentes**: na imensa maioria dos casos, corrija a causa e
 | Tarefa agendada não inicia no boot / app parada depois de reiniciar o servidor | [T15](#t15-tarefa-agendada-nao-sobe-no-boot) |
 | Desinstalação: volume/diretório PRESERVADO | [T16](#t16-desinstalacao-preservou-itens) |
 | Ambiente corporativo com proxy / sem internet | [T17](#t17-proxy-ou-rede-restrita) |
+| "Falha ao montar DATABASE_URL (percent-encoding via Python)" com SyntaxError | [T18](#t18-falha-ao-montar-database_url-percent-encoding-via-python) |
+| Servidor MySQL 8 existente / "cryptography is required for sha256_password" | [T19](#t19-servidor-mysql-8-existente-serviço-mysql80--cryptography-is-required) |
 
 ---
 
@@ -117,7 +119,13 @@ powershell -ExecutionPolicy Bypass -File install.ps1 -NonInteractive -GenerateDb
 Remove-Item Env:\SISPAT_DB_ADMIN_PASSWORD
 ```
 
-No modo interativo o instalador simplesmente pede a senha sem eco. Se você **perdeu** a senha de root, siga o procedimento oficial de reset (skip-grant-tables) da documentação do MariaDB e reexecute.
+No modo interativo o instalador simplesmente pede a senha sem eco. Se você **perdeu** a senha de root, redefina com o script auxiliar (método oficial `--init-file` do MySQL — bancos e dados preservados; o banco fica offline brevemente):
+
+```powershell
+# Em PowerShell como Administrador, na pasta do instalador:
+powershell -ExecutionPolicy Bypass -File reset-root.ps1
+# Depois reexecute o instalador informando a nova senha.
+```
 
 Teste manual (senha vai por ambiente — nunca no argv):
 
@@ -178,6 +186,25 @@ Teste manual da conexão (usa o `DATABASE_URL` do `.env` — rode de dentro do d
 cd C:\SisPatrimonioPro
 .venv\Scripts\python.exe -c "from app.config import DATABASE_URL; from sqlalchemy import create_engine, text; c = create_engine(DATABASE_URL).connect(); print('OK:', c.execute(text('SELECT DATABASE()')).scalar()); c.close()"
 ```
+
+### T19. Servidor MySQL 8 existente (serviço MYSQL80) / "cryptography is required"
+
+**Contexto:** o instalador nativo reutiliza o servidor de banco já presente na máquina (MariaDB **ou** MySQL — decisão D3). Em servidores com **MySQL 8**, dois pontos diferem:
+
+1. A autenticação administrativa usa a **senha de root do MySQL** (não existe equivalente do unix_socket do Linux). Se a senha foi digitada e ainda assim falhou, veja T6.
+2. O MySQL 8 usa o plugin `caching_sha2_password` por padrão, e o PyMySQL só autentica nele com o pacote **`cryptography`** — sem ele, a conexão falha com `RuntimeError: cryptography is required for sha256_password or caching_sha2_password`.
+
+**Solução:** versões antigas do instalador não instalavam `cryptography` (o alvo original era MariaDB). O instalador corrigido garante o pacote no venv automaticamente — se o venv foi criado por uma versão antiga, ele é recriado na reexecução (artefato regenerável; nenhum dado é afetado). Basta **reexecutar** e informar a senha de root quando solicitado (sem eco).
+
+Teste manual da autenticação (senha vai por ambiente — nunca no argv):
+
+```powershell
+$env:MYSQL_PWD = 'senha-do-root'
+& "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -uroot -h 127.0.0.1 -P 3306 -e "SELECT VERSION();"
+Remove-Item Env:\MYSQL_PWD
+```
+
+> **Dica de digitação:** layouts de teclado diferentes na janela elevada (ABNT2 vs inglês) trocam símbolos silenciosamente. Confira a senha digitando-a no Bloco de Notas **dentro da mesma janela elevada** antes de tentar de novo. O instalador mostra o erro real do servidor ao falhar — `using password: NO` significa senha vazia chegando; `using password: YES` com `Access denied` significa senha errada para `root@localhost`.
 
 ### T10. Acesso via rede bloqueado (firewall)
 
@@ -301,6 +328,20 @@ Start-ScheduledTask -TaskName sispatrimoniopro        # sobe manualmente agora
 | "Docker daemon indisponivel — volume PRESERVADO" | sem o Docker ativo não há como remover o volume com segurança | inicie o Docker Desktop e reexecute o desinstalador (idempotente) |
 
 Todos os desinstaladores podem ser reexecutados quantas vezes quiser — itens já removidos são apenas reportados como "nada a fazer".
+
+### T18. "Falha ao montar DATABASE_URL (percent-encoding via Python)"
+
+**Sintoma (instalador nativo, etapa 5/15 — Montagem da URL do banco):**
+
+```
+SyntaxError: invalid syntax
+  import os; from urllib.parse import quote; print(mariadb+pymysql://...
+[ERRO ] Falha ao montar DATABASE_URL (percent-encoding via Python).
+```
+
+**Causa:** versões antigas do instalador (≤ 1.1.0-win) passavam código Python via `python -c "..."`. O PowerShell 5.1, ao chamar executáveis nativos, remove as aspas duplas internas da linha de comando — o Python recebia código inválido e falhava com `SyntaxError`.
+
+**Solução:** use o instalador corrigido (o código Python agora é gravado em arquivo temporário pela função `Invoke-PyCode` — nada de código por argv) e **reexecute**: as etapas anteriores (pacotes, clone, venv, banco) são reutilizadas e nenhum dado é apagado.
 
 ---
 
