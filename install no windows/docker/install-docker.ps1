@@ -34,6 +34,7 @@
     powershell -ExecutionPolicy Bypass -File install-docker.ps1
     powershell -ExecutionPolicy Bypass -File install-docker.ps1 -NonInteractive -GenerateDbPassword
     powershell -ExecutionPolicy Bypass -File install-docker.ps1 -ResetDb   # APAGA o volume do banco (destrutivo)
+    powershell -ExecutionPolicy Bypass -File install-docker.ps1 -Update    # atualiza instalacao existente (.env/dados preservados)
 
     Requer Docker Desktop em execucao (ou Docker Engine + Compose v2).
     Codigo 100% ASCII: evita corrupcao de acentos em Windows PowerShell 5.1.
@@ -54,6 +55,7 @@ param(
     [switch]$GenerateDbPassword,
     [string]$AppPort,
     [switch]$ResetDb,
+    [switch]$Update,
     [switch]$Help
 )
 
@@ -77,7 +79,7 @@ $HealthTimeoutSeconds  = 180
 $DbWaitTimeoutSeconds  = 240
 $AppInternalPort   = '8000'
 
-$AppVersionInstaller = '2.1.0-docker-win'
+$AppVersionInstaller = '2.2.0-docker-win'
 $Script:Step   = ''
 $Script:StepNo = 0
 $TotalSteps    = 10
@@ -92,6 +94,7 @@ $script:DbNameCli        = $DbName    # somente conferencia contra o compose
 $script:DbUserCli        = $DbUser
 $script:DbNameProvided   = [bool]$DbName
 $script:DbUserProvided   = [bool]$DbUser
+$script:AppPortProvided  = $PSBoundParameters.ContainsKey('AppPort')  # ignorado com -Update
 
 $script:ReusedEnv      = $false   # true quando .env existente foi reutilizado
 $script:ExistingVolume = $false   # volume do banco ja existe antes desta execucao
@@ -201,6 +204,9 @@ Uso: powershell -ExecutionPolicy Bypass -File install-docker.ps1 [opcoes]
   -ResetDb                     APAGA o volume do banco e recria do zero (SO interativo;
                                dupla confirmacao; proibido com -NonInteractive;
                                NAO afeta o volume app-data - backups/logs preservados)
+  -Update                      Atualiza uma instalacao existente (git fetch + pull
+                               --ff-only + rebuild da imagem + init_db + reinicio;
+                               .env, banco e volumes NUNCA sao alterados)
   -Help                        Esta ajuda
 
 Nota: esta variante usa o docker-compose.yml + Dockerfile versionados no
@@ -241,12 +247,22 @@ function Validate-Inputs {
         die "Porta da aplicacao invalida: $AppPort (1-65535)"
     }
 
+    # Atualizacao (-Update): flags destrutivas/de credencial sao proibidas -
+    # mesmo contrato do install.ps1 -Update (a senha vigente vive no .env)
+    if ($Update) {
+        if ($ResetDb)            { die 'Combinacao invalida: -ResetDb e proibida com -Update (a atualizacao nunca apaga dados).' }
+        if ($DbPassword)         { die 'Combinacao invalida: -DbPassword nao se aplica a -Update (a senha vigente vive no .env).' }
+        if ($GenerateDbPassword) { die 'Combinacao invalida: -GenerateDbPassword nao se aplica a -Update (a senha vigente vive no .env).' }
+        if ($AppPortProvided)    { warn '-AppPort e ignorado na atualizacao: a porta vigente e lida do .env.' }
+    }
+
     # Recriacao do volume e PROIBIDA em modo nao interativo (mesma decisao D2)
     if ($ResetDb -and $NonInteractive) {
         die 'Combinacao invalida: -ResetDb e proibida com -NonInteractive.'
     }
     # No modo nao interativo, senha deve ser fornecida ou marcada como gerada
-    if ($NonInteractive -and -not $GenerateDbPassword -and -not $DbPassword) {
+    # (irrelevante em -Update: as credenciais vigentes sao lidas do .env)
+    if ($NonInteractive -and -not $Update -and -not $GenerateDbPassword -and -not $DbPassword) {
         die 'Modo nao interativo exige -DbPassword ou -GenerateDbPassword.'
     }
     if ($DbPassword -and $GenerateDbPassword) {
@@ -844,6 +860,113 @@ function Security-SelfCheck {
 }
 
 # ----------------------------------------------------------------------------
+# 061/CS-5 - atualizacao de instalacao existente (-Update): codigo + imagem +
+# schema + reinicio. .env e dados NUNCA tocados; arvore suja ABORTA (o
+# instalador nunca reverte codigo); pull e --ff-only (nunca merge/force).
+# Fluxo proprio: NAO coleta segredos nem toca .env - reutiliza banco,
+# containers e volumes existentes.
+# ----------------------------------------------------------------------------
+function Update-CheckExisting {
+    $miss = @()
+    if (-not (Test-Path (Join-Path $InstallDir '.git')))               { $miss += '.git (clone)' }
+    if (-not (Test-Path (Join-Path $InstallDir '.env')))               { $miss += '.env' }
+    if (-not (Test-Path (Join-Path $InstallDir 'docker-compose.yml'))) { $miss += 'docker-compose.yml' }
+    if (-not (Test-Path (Join-Path $InstallDir 'Dockerfile')))         { $miss += 'Dockerfile' }
+    if ($miss.Count -gt 0) {
+        die ("-Update exige uma instalacao existente em $InstallDir (ausente: " + ($miss -join ', ') + "). Para primeira instalacao, execute sem -Update; para reparo, reexecute o instalador completo.")
+    }
+    # Docker + Compose + daemon: a atualizacao NAO instala infraestrutura
+    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
+        die 'Docker CLI ausente - a atualizacao nao instala infraestrutura; instale o Docker Desktop/Engine (ou reexecute o instalador completo sem -Update).'
+    }
+    & docker compose version *> $null
+    if ($LASTEXITCODE -ne 0) { die 'Docker Compose v2 indisponivel (docker compose version falhou). Atualize o Docker Desktop/Engine e reexecute.' }
+    & docker info *> $null
+    if ($LASTEXITCODE -ne 0) { die 'Daemon do Docker indisponivel (docker info falhou). Inicie o Docker Desktop e reexecute.' }
+    ok 'Docker + Compose v2 disponiveis (daemon em execucao).'
+
+    # O .env e a fonte da verdade da instalacao: NADA e gravado/gerado aqui
+    # (o fluxo de atualizacao nao chama Ensure-EnvFile)
+    $envFile = Join-Path $InstallDir '.env'
+    $script:DbPassword = Read-EnvValue $envFile 'DB_PASSWORD'
+    if (-not $DbPassword) {
+        die '.env sem DB_PASSWORD - corrija o .env manualmente e reexecute (a atualizacao nunca altera o .env).'
+    }
+    $script:DbRootPassword = Read-EnvValue $envFile 'DB_ROOT_PASSWORD'
+    if (-not $DbRootPassword) {
+        warn 'DB_ROOT_PASSWORD ausente no .env - o realinhamento de senha (se necessario) nao estara disponivel.'
+    }
+    $script:SecretKey = Read-EnvValue $envFile 'SECRET_KEY'
+    $port = Read-EnvValue $envFile 'APP_PORT'
+    if ($port) { $script:AppPort = $port }
+    $script:ReusedEnv = $true
+    ok "Instalacao existente valida em $InstallDir - .env e dados PRESERVADOS (porta da app: $AppPort)."
+}
+
+function Update-Repo {
+    $dirty = (& git -C $InstallDir status --porcelain 2>$null)
+    if ($dirty) {
+        warn 'A arvore do clone possui alteracoes locais (git status nao vazio).'
+        die 'Atualizacao abortada: o instalador NUNCA reverte codigo - resolva as alteracoes locais (commit/stash) manualmente e reexecute -Update.'
+    }
+    & git -C $InstallDir fetch origin $BranchValue 2>&1 | ForEach-Object { Write-Host "    $_" }
+    if ($LASTEXITCODE -ne 0) { die 'git fetch falhou (rede/repositorio) - nenhuma alteracao aplicada; reexecute -Update mais tarde.' }
+    $remote = (& git -C $InstallDir rev-parse "origin/$BranchValue" 2>$null)
+    if (-not $remote) { die "Branch remota 'origin/$BranchValue' nao encontrada apos o fetch." }
+    $localShort = (& git -C $InstallDir rev-parse --short HEAD 2>$null)
+    if (([string](& git -C $InstallDir rev-parse HEAD 2>$null)).Trim() -eq (([string]$remote).Trim())) {
+        ok "Codigo ja atualizado (HEAD = origin/$BranchValue) - nada a aplicar."
+        return
+    }
+    & git -C $InstallDir pull --ff-only origin $BranchValue 2>&1 | ForEach-Object { Write-Host "    $_" }
+    if ($LASTEXITCODE -ne 0) { die 'pull --ff-only falhou (historico divergido) - nenhuma alteracao aplicada. Resolva a divergencia manualmente e reexecute -Update.' }
+    ok ("Codigo atualizado: {0} -> {1}." -f $localShort, (& git -C $InstallDir rev-parse --short HEAD 2>$null))
+}
+
+function Print-UpdateSummary {
+    $ip = Get-PrimaryIPv4
+    Write-Host ''
+    Write-Host '  ==============================================================' -ForegroundColor White
+    ok 'SisPatrimonio Pro atualizado com sucesso (DOCKER Windows)!'
+    Write-Host '  ==============================================================' -ForegroundColor White
+    Write-Host ''
+    Write-Host ("    Aplicacao    : http://{0}:{1}" -f $ip, $AppPort)
+    Write-Host ("    Health check : http://{0}:{1}/health" -f $ip, $AppPort)
+    Write-Host ('    Diretorio    : ' + $InstallDir)
+    Write-Host ('    Containers   : ' + $AppCname + ' | ' + $DbCname + ' (recriados apenas se compose/imagem mudaram)')
+    Write-Host ('    Volume bd    : ' + $DbVolume + ' (PRESERVADO - nenhuma alteracao de dados)')
+    Write-Host '    .env e dados de producao: PRESERVADOS (a atualizacao nunca os altera).'
+    Write-Host ('    Log          : ' + $InstallLog)
+    Write-Host ''
+}
+
+function Update-Main {
+    $script:TotalSteps = 9
+    $Script:StepNo = 0
+
+    Write-Host ''
+    Write-Host '=============================================================='
+    info "SisPatrimonio Pro - ATUALIZACAO DOCKER (Windows) v$AppVersionInstaller ($(Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))"
+    Write-Host '=============================================================='
+    Write-Host ''
+
+    # Validate-Inputs e Require-Admin ja foram executados pelo Main antes do dispatch
+    Write-Step 'Verificacao da instalacao existente'   ; Update-CheckExisting
+    Write-Step 'Verificacao de conectividade'          ; Test-Connectivity
+    Write-Step 'Codigo-fonte (fetch + pull --ff-only)' ; Update-Repo
+    Write-Step 'docker-compose.yml do repo (re-analise)'; Parse-ComposeConfig
+    Write-Step 'Rebuild da imagem (servico app)'       ; Invoke-ComposeBuild
+    Write-Step 'Banco de dados (volume preservado)'    ; Ensure-Database
+    Write-Step 'Atualizacao do schema (init_db)'       ; Init-Database
+    Write-Step 'Start + health check'                  ; Start-AndHealthCheck
+    Write-Step 'Bateria pos-atualizacao'               ; Post-InstallChecks
+    Security-SelfCheck   # auditoria final (SR-001): nada vazou para o log
+
+    Print-UpdateSummary
+    ok 'Atualizacao concluida.'
+}
+
+# ----------------------------------------------------------------------------
 # Resumo final
 # ----------------------------------------------------------------------------
 function Get-PrimaryIPv4 {
@@ -911,6 +1034,10 @@ function Main {
     Parse-Args
     Validate-Inputs
     Require-Admin
+
+    # 061/CS-5: a atualizacao tem fluxo proprio (nunca coleta segredos nem
+    # toca .env/dados; reutiliza banco, containers e volumes existentes)
+    if ($Update) { Update-Main; return }
 
     Write-Host ''
     Write-Host '=============================================================='

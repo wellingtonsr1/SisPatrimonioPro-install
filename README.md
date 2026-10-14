@@ -69,6 +69,9 @@ Documentação e análise aprofundada dos instaladores de produção do SisPatri
   --db-name / --db-user       SOMENTE conferência: divergir do compose do repo aborta
   --app-port <porta>          Porta da aplicação no HOST (default: 8000)
   --reset-db                  APAGA o volume do banco (dupla confirmação; interativo apenas)
+  --update                    Atualiza uma instalação existente (git fetch + pull --ff-only +
+                              rebuild da imagem + init_db + reinício; .env, banco e
+                              volumes NUNCA são alterados)
   --help                      Ajuda completa
   ```
 
@@ -184,7 +187,7 @@ Documentação e análise aprofundada dos instaladores de produção do SisPatri
   | `--service-name` / `--service-user` | `-ServiceName` / `-ServiceUser` | tarefa agendada; default: `sispatrimoniopro` / `SYSTEM` |
   | `--recreate-db` | `-RecreateDb` | APAGA o banco (dupla confirmação; proibido com `-NonInteractive`) |
   | `--reset-db` (Docker) | `-ResetDb` | APAGA o **volume** do banco (dupla confirmação; `app-data` preservado) |
-  | `--update` | `-Update` | atualiza a instalação existente (código + dependências + schema + reinício; `.env` e dados preservados) — veja **🔄 Atualização da instalação** |
+  | `--update` | `-Update` | atualiza a instalação existente (nativa: código + dependências + schema; Docker: código + rebuild da imagem + schema; `.env` e dados preservados) — veja **🔄 Atualização da instalação** |
 
   #### Equivalências e divergências técnicas (necessárias no Windows)
 
@@ -403,6 +406,20 @@ Garantias:
 - Código já atualizado → a execução é no-op seguro (reexecutável à vontade).
 - Requisito: acesso à internet ao repositório (git) e ao PyPI (pip) — não é suportado com `--wheel-dir`.
 - Flags incompatíveis (recusadas antes de qualquer mutação): `--recreate-db`/`-RecreateDb` (a atualização nunca apaga dados), `--db-password`/`--generate-db-password`/`-DbPassword`/`-GenerateDbPassword` (a senha vigente vive no `.env`), `--regenerate-cert`/`-RegenerateCert` (o certificado TLS existente é reutilizado).
+
+#### Variante Docker (`--update` / `-Update`)
+
+A variante Docker tem o mesmo fluxo de atualização, adaptado aos containers (9 etapas): valida a instalação existente (clone Git + `.env` + compose/Dockerfile do repo + Docker daemon ativo), conectividade, **`git fetch` + `pull --ff-only`**, re-análise do `docker-compose.yml`, **rebuild da imagem** (camadas cacheadas — só o que mudou é reconstruído), container do banco (volume `db-data` reutilizado), `init_db()` em container efêmero (migrações de schema), start + `/health` e bateria pós-atualização.
+
+```bash
+sudo bash install-docker.sh --update
+```
+
+```powershell
+powershell -ExecutionPolicy Bypass -File install-docker.ps1 -Update
+```
+
+Garantias (idênticas ao nativo): `.env`, volume do banco (`db-data`) e `app-data` **nunca são alterados**; árvore suja ou histórico divergente abortam **antes de qualquer mutação**; código já atualizado → no-op seguro (reexecutável à vontade); containers são recriados apenas quando o compose ou a imagem mudam. Flags recusadas com `--update`: `--reset-db`/`-ResetDb`, `--db-password`/`-DbPassword`, `--generate-db-password`/`-GenerateDbPassword` (a senha vigente vive no `.env`); `--app-port`/`-AppPort` é ignorado (a porta vigente é lida do `.env`). Requer acesso ao repositório (git); **não** instala infraestrutura — Docker e Compose v2 precisam já estar presentes e o daemon em execução.
 
 ──────
 ## 🗄️ Banco de dados: versões suportadas e XAMPP (feature 061 — FR-013)

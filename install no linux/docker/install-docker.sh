@@ -39,6 +39,7 @@
 #   sudo bash install-docker.sh
 #   sudo bash install-docker.sh --non-interactive --generate-db-password
 #   sudo bash install-docker.sh --reset-db   # APAGA o volume do banco (destrutivo)
+#   sudo bash install-docker.sh --update     # atualiza instalação existente (.env/dados preservados)
 #
 # Contrato base: specs/027-instalador-producao-linux/contracts/installer-contract.md
 # (variante Docker mantém o mesmo contrato, trocando systemd/venv/MariaDB
@@ -61,13 +62,15 @@ readonly HEALTH_TIMEOUT_SECONDS=180
 readonly DB_WAIT_TIMEOUT_SECONDS=240
 readonly APP_INTERNAL_PORT="8000"
 
-APP_VERSION_INSTALLER="2.1.0-docker"
+APP_VERSION_INSTALLER="2.2.0-docker"
 NON_INTERACTIVE="false"
 RESET_DB="false"
+UPDATE="false"             # --update: atualiza instalação existente (feature 061/CS-5)
 INSTALL_DIR=""
 REPO_URL="$DEFAULT_REPO_URL"
 BRANCH="$DEFAULT_BRANCH"
 APP_PORT="$DEFAULT_APP_PORT"
+APP_PORT_PROVIDED="false"  # --app-port informado na CLI (ignorado com --update)
 GENERATE_DB_PASSWORD="false"
 DB_PASSWORD=""
 SECRET_KEY=""
@@ -229,6 +232,9 @@ Uso: sudo bash install-docker.sh [opções]
   --reset-db                  APAGA o volume do banco e recria do zero (SÓ interativo;
                               dupla confirmação; proibido com --non-interactive;
                               NÃO afeta o volume app-data — backups/logs preservados)
+  --update                    Atualiza uma instalação existente (git fetch + pull
+                              --ff-only + rebuild da imagem + init_db + reinício;
+                              .env, banco e volumes NUNCA são alterados)
   --app-host <host>           Sem efeito nesta variante (o compose publica em 0.0.0.0)
   --service-name <nome>       Sem efeito (projeto Compose deriva do diretório de instalação)
   --service-user <usuário>    Sem efeito (containers usam os usuários internos da imagem)
@@ -253,8 +259,9 @@ parse_args() {
             --db-user)         DB_USER_CLI="${2:-}"; DB_USER_PROVIDED="true"; shift ;;
             --db-password)     DB_PASSWORD="${2:-}"; shift ;;
             --generate-db-password) GENERATE_DB_PASSWORD="true" ;;
-            --app-port)        APP_PORT="${2:-}"; shift ;;
+            --app-port)        APP_PORT="${2:-}"; APP_PORT_PROVIDED="true"; shift ;;
             --reset-db)        RESET_DB="true" ;;
+            --update)          UPDATE="true" ;;
             --app-host)        warn "--app-host é sem efeito nesta variante (o compose publica a porta em 0.0.0.0)."; shift ;;
             --service-name)    warn "--service-name é sem efeito nesta variante (projeto Compose deriva do diretório de instalação)."; shift ;;
             --service-user)    warn "--service-user é sem efeito nesta variante (containers usam os usuários internos da imagem)."; shift ;;
@@ -295,13 +302,31 @@ validate_inputs() {  # validação TOTAL antes da primeira mutação
         die "Porta da aplicação inválida: $APP_PORT (1–65535)"
     fi
 
+    # Atualização (--update): flags destrutivas/de credencial são proibidas —
+    # mesmo contrato do install.sh --update (a senha vigente vive no .env)
+    if [ "$UPDATE" = "true" ]; then
+        if [ "$RESET_DB" = "true" ]; then
+            die "Combinação inválida: --reset-db é proibida com --update (a atualização nunca apaga dados)."
+        fi
+        if [ -n "$DB_PASSWORD" ]; then
+            die "Combinação inválida: --db-password não se aplica a --update (a senha vigente vive no .env)."
+        fi
+        if [ "$GENERATE_DB_PASSWORD" = "true" ]; then
+            die "Combinação inválida: --generate-db-password não se aplica a --update (a senha vigente vive no .env)."
+        fi
+        if [ "$APP_PORT_PROVIDED" = "true" ]; then
+            warn "--app-port é ignorado na atualização: a porta vigente é lida do .env."
+        fi
+    fi
+
     # Recriação do volume é PROIBIDA em modo não interativo (mesma decisão D2)
     if [ "$RESET_DB" = "true" ] && [ "$NON_INTERACTIVE" = "true" ]; then
         die "Combinação inválida: --reset-db é proibida com --non-interactive."
     fi
 
     # No modo não interativo, senha deve ser fornecida ou marcada como gerada
-    if [ "$NON_INTERACTIVE" = "true" ]; then
+    # (irrelevante em --update: as credenciais vigentes são lidas do .env)
+    if [ "$NON_INTERACTIVE" = "true" ] && [ "$UPDATE" != "true" ]; then
         if [ "$GENERATE_DB_PASSWORD" != "true" ] && [ -z "$DB_PASSWORD" ]; then
             die "Modo não interativo exige --db-password ou --generate-db-password."
         fi
@@ -1041,10 +1066,128 @@ print_summary() {
 }
 
 # ----------------------------------------------------------------------------
+# 061/CS-5 — atualização de instalação existente (--update): código + imagem +
+# schema + reinício. .env e dados NUNCA tocados; árvore suja ABORTA (o
+# instalador nunca reverte código); pull é --ff-only (nunca merge/force).
+# Fluxo próprio: NÃO coleta segredos nem toca .env — reutiliza banco,
+# containers e volumes existentes.
+# ----------------------------------------------------------------------------
+update_check_existing() {
+    STEP="Verificação da instalação existente"
+    local miss=""
+    [ -d "$INSTALL_DIR/.git" ]               || miss="$miss .git(clone)"
+    [ -f "$INSTALL_DIR/.env" ]               || miss="$miss .env"
+    [ -f "$INSTALL_DIR/docker-compose.yml" ] || miss="$miss docker-compose.yml"
+    [ -f "$INSTALL_DIR/Dockerfile" ]         || miss="$miss Dockerfile"
+    if [ -n "$miss" ]; then
+        die "Atualização exige uma instalação existente em $INSTALL_DIR (ausente:${miss}). Para primeira instalação, execute sem --update; para reparo, reexecute o instalador completo."
+    fi
+    # Docker + Compose + daemon: a atualização NÃO instala infraestrutura
+    command -v docker >/dev/null 2>&1 \
+        || die "Docker CLI ausente — a atualização não instala infraestrutura; instale o Docker (ou reexecute o instalador completo sem --update)."
+    docker compose version >/dev/null 2>&1 \
+        || die "Docker Compose v2 indisponível (docker compose version falhou). Atualize o Docker Engine e reexecute."
+    docker info >/dev/null 2>&1 \
+        || die "Daemon do Docker indisponível (docker info falhou). Verifique: systemctl status docker"
+    ok "Docker + Compose v2 disponíveis (daemon em execução)."
+
+    # O .env é a fonte da verdade da instalação: NADA é gravado/gerado aqui
+    # (o fluxo de atualização não chama ensure_env_file)
+    local env_file="$INSTALL_DIR/.env" p
+    DB_PASSWORD="$(grep -E '^DB_PASSWORD=' "$env_file" | head -n1 | cut -d= -f2- || true)"
+    [ -n "$DB_PASSWORD" ] || die ".env sem DB_PASSWORD — corrija o .env manualmente e reexecute (a atualização nunca altera o .env)."
+    DB_ROOT_PASSWORD="$(grep -E '^DB_ROOT_PASSWORD=' "$env_file" | head -n1 | cut -d= -f2- || true)"
+    [ -n "$DB_ROOT_PASSWORD" ] || warn "DB_ROOT_PASSWORD ausente no .env — o realinhamento de senha (se necessário) não estará disponível."
+    SECRET_KEY="$(grep -E '^SECRET_KEY=' "$env_file" | head -n1 | cut -d= -f2- || true)"
+    p="$(grep -E '^APP_PORT=' "$env_file" | head -n1 | cut -d= -f2- || true)"
+    [ -n "$p" ] || p="$DEFAULT_APP_PORT"
+    APP_PORT="$p"
+    REUSED_ENV="true"
+    ok "Instalação existente válida em $INSTALL_DIR — .env e dados PRESERVADOS (porta da app: $APP_PORT)."
+}
+
+update_repo() {
+    STEP="Código-fonte (fetch + pull --ff-only)"
+    local dirty local_head remote_head
+    dirty="$(git -C "$INSTALL_DIR" status --porcelain || true)"
+    if [ -n "$dirty" ]; then
+        err "A árvore do clone possui alterações locais (git status não vazio)."
+        die "Atualização abortada: o instalador NUNCA reverte código — resolva as alterações locais (commit/stash) manualmente e reexecute --update."
+    fi
+    if ! git -C "$INSTALL_DIR" fetch origin "$BRANCH" >&2; then
+        die "git fetch falhou (rede/repositório) — nenhuma alteração aplicada; reexecute --update mais tarde."
+    fi
+    remote_head="$(git -C "$INSTALL_DIR" rev-parse --short "origin/$BRANCH" 2>/dev/null || true)"
+    if [ -z "$remote_head" ]; then
+        die "Branch remota 'origin/$BRANCH' não encontrada após o fetch."
+    fi
+    local_head="$(git -C "$INSTALL_DIR" rev-parse --short HEAD)"
+    if [ "$local_head" = "$remote_head" ]; then
+        ok "Código já atualizado (HEAD = origin/$BRANCH) — nada a aplicar."
+        return 0
+    fi
+    if ! git -C "$INSTALL_DIR" pull --ff-only origin "$BRANCH" >&2; then
+        die "pull --ff-only falhou (histórico divergido) — nenhuma alteração aplicada. Resolva a divergência manualmente e reexecute --update."
+    fi
+    ok "Código atualizado: $local_head -> $(git -C "$INSTALL_DIR" rev-parse --short HEAD)."
+}
+
+print_update_summary() {
+    local ip_addr
+    ip_addr="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    echo >&2
+    echo "${C_BOLD}  ══════════════════════════════════════════════════════════════${C_RESET}" >&2
+    ok "SisPatrimônio Pro atualizado com sucesso (DOCKER)!"
+    echo "${C_BOLD}  ══════════════════════════════════════════════════════════════${C_RESET}" >&2
+    echo >&2
+    _kv "Aplicação   " "http://${ip_addr:-$(hostname -f 2>/dev/null || echo localhost)}:$APP_PORT"
+    _kv "Health check" "http://${ip_addr:-$(hostname -f 2>/dev/null || echo localhost)}:$APP_PORT/health"
+    _kv "Diretório   " "$INSTALL_DIR"
+    _kv "Containers  " "$APP_CNAME · $DB_CNAME (recriados apenas se compose/imagem mudaram)"
+    _kv "Volume bd   " "$DB_VOLUME (PRESERVADO — nenhuma alteração de dados)"
+    _kv "Configuração" "$INSTALL_DIR/.env (PRESERVADO — nenhuma chave alterada)"
+    _kv "Log         " "$INSTALL_LOG"
+    echo >&2
+}
+
+update_main() {  # fluxo próprio (não coleta segredos nem toca .env/dados)
+    setup_logging
+    echo >&2
+    echo "==============================================================" >&2
+    info "SisPatrimônio Pro — ATUALIZAÇÃO DOCKER v${APP_VERSION_INSTALLER} ($(date '+%Y-%m-%d %H:%M:%S'))"
+    echo "==============================================================" >&2
+    echo >&2
+
+    STEP="Parâmetros e validação"
+    validate_inputs
+    require_root
+    TOTAL_STEPS=9
+    run_step "Verificação da instalação existente"     update_check_existing
+    run_step "Verificação de conectividade"            check_connectivity
+    run_step "Código-fonte (fetch + pull --ff-only)"   update_repo
+    run_step "docker-compose.yml do repo (re-análise)" parse_compose_config
+    run_step "Rebuild da imagem (serviço app)"         compose_build
+    run_step "Banco de dados (volume preservado)"      ensure_database
+    run_step "Atualização do schema (init_db)"         init_database
+    run_step "Start + health check"                    start_and_health_check
+    run_step "Bateria pós-atualização"                 post_install_checks
+    security_self_check   # auditoria final (SR-001): nada vazou para o log
+
+    print_update_summary
+    ok "Atualização concluída."
+}
+
+# ----------------------------------------------------------------------------
 # main
 # ----------------------------------------------------------------------------
 main() {
     parse_args "$@"
+    # 061/CS-5: a atualização tem fluxo próprio (nunca coleta segredos nem
+    # toca .env/dados; reutiliza banco, containers e volumes existentes)
+    if [ "$UPDATE" = "true" ]; then
+        update_main
+        return 0
+    fi
     setup_logging
     echo >&2
     echo "==============================================================" >&2
